@@ -15,6 +15,7 @@
 #include <helpers/IdentityStore.h>
 #include <RTClib.h>
 #include <target.h>
+#include "utils.h"
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
@@ -48,6 +49,11 @@
 #define DIRECT_SEND_PERHOP_EXTRA_MILLIS   250
 
 #define  PUBLIC_GROUP_PSK  "izOH6cXN6mrJ5e26oRXNcg=="
+#define  TEST_GROUP_PSK    "MDAwMDAwMDAwMDAwMDAwMA=="
+
+#ifndef SERIAL_BAUD
+#define SERIAL_BAUD 115200
+#endif
 
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
@@ -67,7 +73,9 @@ struct NodePrefs {  // persisted to file
   double node_lat, node_lon;
   float freq;
   uint8_t tx_power_dbm;
-  uint8_t unused[3];
+  uint8_t sf;           // spread factor
+  uint8_t cr;           // coding rate
+  float bw;             // bandwidth
 };
 
 class MyMesh : public BaseChatMesh, ContactVisitor {
@@ -75,6 +83,7 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   NodePrefs _prefs;
   uint32_t expected_ack_crc;
   ChannelDetails* _public;
+  ChannelDetails* _test;
   unsigned long last_msg_sent;
   ContactInfo* curr_recipient;
   char command[512+10];
@@ -204,22 +213,27 @@ protected:
 
   void onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
     // TODO: if not in favs,  prompt to add as fav(?)
-
-    Serial.printf("ADVERT from -> %s\n", contact.name);
-    Serial.printf("  type: %s\n", getTypeName(contact.type));
-    Serial.print("   public key: "); mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE); Serial.println();
+    Serial.print("\r\n");
+    Serial.printf("ADVERT from -> %s", contact.name);
+    Serial.printf(" | type: %s", getTypeName(contact.type));
+    Serial.print(" | public key: "); mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE); Serial.println();
+    Serial.print("\r> ");
 
     saveContacts();
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
+    Serial.print("\r\n");
     Serial.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t) contact.out_path_len);
+    Serial.print("\r> ");
     saveContacts();
   }
 
   ContactInfo* processAck(const uint8_t *data) override {
     if (memcmp(data, &expected_ack_crc, 4) == 0) {     // got an ACK from recipient
+      Serial.print("\r\n");
       Serial.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
+      Serial.print("\r> ");
       // NOTE: the same ACK can be received multiple times!
       expected_ack_crc = 0;  // reset our expected hash, now that we have received ACK
       return NULL;  // TODO: really should return ContactInfo pointer 
@@ -232,8 +246,16 @@ protected:
   }
 
   void onMessageRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {
+    // Create a mutable copy of the text to remove diacritics
+    char text_copy[256];
+    strncpy(text_copy, text, sizeof(text_copy) - 1);
+    text_copy[sizeof(text_copy) - 1] = 0;
+    removeDiacritics(text_copy);
+    
+    Serial.print("\r\n");  // carriage return + newline to separate from any input
     Serial.printf("(%s) MSG -> from %s\n", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", from.name);
-    Serial.printf("   %s\n", text);
+    Serial.printf("   %s\n", text_copy);
+    Serial.print("\r> ");  // carriage return + prompt
 
     if (strcmp(text, "clock sync") == 0) {  // special text command
       setClock(sender_timestamp + 1);
@@ -246,12 +268,28 @@ protected:
   }
 
   void onChannelMessageRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t timestamp, const char *text) override {
-    if (pkt->isRouteDirect()) {
-      Serial.printf("PUBLIC CHANNEL MSG -> (Direct!)\n");
-    } else {
-      Serial.printf("PUBLIC CHANNEL MSG -> (Flood) hops %d\n", pkt->path_len);
+    // Create a mutable copy of the text to remove diacritics
+    char text_copy[256];
+    strncpy(text_copy, text, sizeof(text_copy) - 1);
+    text_copy[sizeof(text_copy) - 1] = 0;
+    removeDiacritics(text_copy);
+    
+    Serial.print("\r\n");  // carriage return + newline to separate from any input
+    
+    // Determine channel name
+    const char* channel_name = "UNKNOWN";
+    if (_public && memcmp(channel.hash, _public->channel.hash, sizeof(channel.hash)) == 0) {
+      channel_name = "PUBLIC";
+    } else if (_test && memcmp(channel.hash, _test->channel.hash, sizeof(channel.hash)) == 0) {
+      channel_name = "TEST";
     }
-    Serial.printf("   %s\n", text);
+    
+    if (pkt->isRouteDirect()) {
+      Serial.printf("[%s] DIRECT | %s\n", channel_name, text_copy);
+    } else {
+      Serial.printf("[%s] FLOOD (hops %d) | %s\n", channel_name, pkt->path_len, text_copy);
+    }
+    Serial.print("\r> ");  // carriage return + prompt
   }
 
   uint8_t onContactRequest(const ContactInfo& contact, uint32_t sender_timestamp, const uint8_t* data, uint8_t len, uint8_t* reply) override {
@@ -284,6 +322,9 @@ public:
     strcpy(_prefs.node_name, "NONAME");
     _prefs.freq = LORA_FREQ;
     _prefs.tx_power_dbm = LORA_TX_POWER;
+    _prefs.sf = LORA_SF;
+    _prefs.cr = LORA_CR;
+    _prefs.bw = LORA_BW;
 
     command[0] = 0;
     curr_recipient = NULL;
@@ -291,6 +332,9 @@ public:
 
   float getFreqPref() const { return _prefs.freq; }
   uint8_t getTxPowerPref() const { return _prefs.tx_power_dbm; }
+  uint8_t getSFPref() const { return _prefs.sf; }
+  uint8_t getCRPref() const { return _prefs.cr; }
+  float getBWPref() const { return _prefs.bw; }
 
   void begin(FILESYSTEM& fs) {
     _fs = &fs;
@@ -337,6 +381,23 @@ public:
 
     loadContacts();
     _public = addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
+    _test = addChannel("Test", TEST_GROUP_PSK); // test channel
+  }
+
+  void checkPublicChannel() {
+    if (_public == NULL) {
+      Serial.println("ERROR: Failed to add Public channel!");
+      Serial.println("This usually means base64 decoding failed or PSK has wrong length.");
+      Serial.print("PSK used: "); Serial.println(PUBLIC_GROUP_PSK);
+    } else {
+      Serial.println("Public channel initialized successfully!");
+    }
+    
+    if (_test == NULL) {
+      Serial.println("ERROR: Failed to add Test channel!");
+    } else {
+      Serial.println("Test channel initialized successfully!");
+    }
   }
 
   void savePrefs() {
@@ -355,6 +416,8 @@ public:
   }
 
   void showWelcome() {
+    delay(100);  // Give serial monitor time to connect
+    Serial.println();
     Serial.println("===== MeshCore Chat Terminal =====");
     Serial.println();
     Serial.printf("WELCOME  %s\n", _prefs.node_name);
@@ -362,6 +425,7 @@ public:
     Serial.println();
     Serial.println("   (enter 'help' for basic commands)");
     Serial.println();
+    Serial.print("\r> ");  // initial prompt
   }
 
   void sendSelfAdvert(int delay_millis) {
@@ -399,6 +463,11 @@ public:
         Serial.println("   ERROR: no recipient selected (use 'to' cmd).");
       }
     } else if (memcmp(command, "public ", 7) == 0) {  // send GroupChannel msg
+      if (_public == NULL) {
+        Serial.println("   ERROR: Public channel not initialized!");
+        return;
+      }
+      
       uint8_t temp[5+MAX_TEXT_LEN+32];
       uint32_t timestamp = getRTCClock()->getCurrentTime();
       memcpy(temp, &timestamp, 4);   // mostly an extra blob to help make packet_hash unique
@@ -412,6 +481,28 @@ public:
       if (pkt) {
         sendFlood(pkt);
         Serial.println("   Sent.");
+      } else {
+        Serial.println("   ERROR: unable to send");
+      }
+    } else if (memcmp(command, "test ", 5) == 0) {  // send to Test channel
+      if (_test == NULL) {
+        Serial.println("   ERROR: Test channel not initialized!");
+        return;
+      }
+      
+      uint8_t temp[5+MAX_TEXT_LEN+32];
+      uint32_t timestamp = getRTCClock()->getCurrentTime();
+      memcpy(temp, &timestamp, 4);
+      temp[4] = 0;
+
+      sprintf((char *) &temp[5], "%s: %s", _prefs.node_name, &command[5]);
+      temp[5 + MAX_TEXT_LEN] = 0;
+
+      int len = strlen((char *) &temp[5]);
+      auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _test->channel, temp, 5 + len);
+      if (pkt) {
+        sendFlood(pkt);
+        Serial.println("   Sent to Test channel.");
       } else {
         Serial.println("   ERROR: unable to send");
       }
@@ -497,14 +588,65 @@ public:
         _prefs.freq = atof(&config[5]);
         savePrefs();
         Serial.println("  OK - reboot to apply");
+      } else if (memcmp(config, "sf ", 3) == 0) {
+        _prefs.sf = atoi(&config[3]);
+        savePrefs();
+        Serial.println("  OK - reboot to apply");
+      } else if (memcmp(config, "cr ", 3) == 0) {
+        _prefs.cr = atoi(&config[3]);
+        savePrefs();
+        Serial.println("  OK - reboot to apply");
+      } else if (memcmp(config, "bw ", 3) == 0) {
+        _prefs.bw = atof(&config[3]);
+        savePrefs();
+        Serial.println("  OK - reboot to apply");
       } else {
         Serial.printf("  ERROR: unknown config: %s\n", config);
       }
+    } else if (memcmp(command, "get", 3) == 0) {
+      if (command[3] == 0 || command[3] == ' ') {  // "get" or "get <param>"
+        const char* param = (command[3] == ' ') ? &command[4] : "";
+        bool show_all = (param[0] == 0);
+        
+        if (show_all || strcmp(param, "name") == 0) {
+          Serial.print("  name: "); Serial.println(_prefs.node_name);
+        }
+        if (show_all || strcmp(param, "lat") == 0) {
+          Serial.print("  lat:  "); Serial.println(_prefs.node_lat, 6);
+        }
+        if (show_all || strcmp(param, "lon") == 0) {
+          Serial.print("  lon:  "); Serial.println(_prefs.node_lon, 6);
+        }
+        if (show_all || strcmp(param, "freq") == 0) {
+          Serial.print("  freq: "); Serial.print(_prefs.freq, 3); Serial.println(" MHz");
+        }
+        if (show_all || strcmp(param, "tx") == 0) {
+          Serial.print("  tx:   "); Serial.print(_prefs.tx_power_dbm); Serial.println(" dBm");
+        }
+        if (show_all || strcmp(param, "sf") == 0) {
+          Serial.print("  sf:   "); Serial.println(_prefs.sf);
+        }
+        if (show_all || strcmp(param, "cr") == 0) {
+          Serial.print("  cr:   "); Serial.println(_prefs.cr);
+        }
+        if (show_all || strcmp(param, "bw") == 0) {
+          Serial.print("  bw:   "); Serial.print(_prefs.bw, 1); Serial.println(" kHz");
+        }
+        if (show_all || strcmp(param, "af") == 0) {
+          Serial.print("  af:   "); Serial.println(_prefs.airtime_factor, 2);
+        }
+      }
     } else if (memcmp(command, "ver", 3) == 0) {
       Serial.println(FIRMWARE_VER_TEXT);
+    } else if (memcmp(command, "reboot", 6) == 0) {
+      Serial.println("Rebooting...");
+      Serial.flush();  // ensure message is sent before reboot
+      delay(100);
+      board.reboot();
     } else if (memcmp(command, "help", 4) == 0) {
       Serial.println("Commands:");
-      Serial.println("   set {name|lat|lon|freq|tx|af} {value}");
+      Serial.println("   set {name|lat|lon|freq|tx|sf|cr|bw|af} {value}");
+      Serial.println("   get [{name|lat|lon|freq|tx|sf|cr|bw|af}]");
       Serial.println("   card");
       Serial.println("   import {biz card}");
       Serial.println("   clock");
@@ -516,6 +658,8 @@ public:
       Serial.println("   advert");
       Serial.println("   reset path");
       Serial.println("   public <text>");
+      Serial.println("   test <text>");
+      Serial.println("   reboot");
     } else {
       Serial.print("   ERROR: unknown command: "); Serial.println(command);
     }
@@ -527,21 +671,31 @@ public:
     int len = strlen(command);
     while (Serial.available() && len < sizeof(command)-1) {
       char c = Serial.read();
-      if (c != '\n') { 
+      if (c == '\r' || c == '\n') {
+        if (len > 0) {  // have command to process
+          command[len] = 0;  // null terminate
+          Serial.println();  // echo newline
+          handleCommand(command);
+          Serial.print("\r> ");  // prompt for next command
+          command[0] = 0;  // reset
+          len = 0;
+        }
+      } else if (c == 8 || c == 127) {  // backspace or delete
+        if (len > 0) {
+          len--;
+          command[len] = 0;
+          Serial.print("\b \b");  // backspace, space, backspace - erases character on terminal
+        }
+      } else {
         command[len++] = c;
         command[len] = 0;
+        Serial.print(c);  // echo character as typed
       }
-      Serial.print(c);
     }
-    if (len == sizeof(command)-1) {  // command buffer full
-      command[sizeof(command)-1] = '\r';
-    }
-
-    if (len > 0 && command[len - 1] == '\r') {  // received complete line
-      command[len - 1] = 0;  // replace newline with C string null terminator
-
-      handleCommand(command);
-      command[0] = 0;  // reset command buffer
+    if (len >= sizeof(command)-1) {  // command buffer full
+      Serial.println();
+      Serial.println("   ERROR: command too long");
+      command[0] = 0;
     }
   }
 };
@@ -555,11 +709,14 @@ void halt() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(SERIAL_BAUD);
+  delay(100);  // Give serial time to initialize
 
   board.begin();
 
-  if (!radio_init()) { halt(); }
+  if (!radio_init()) { 
+    halt(); 
+  }
 
   fast_rng.begin(radio_get_rng_seed());
 
@@ -576,13 +733,14 @@ void setup() {
   #error "need to define filesystem"
 #endif
 
-  radio_set_params(the_mesh.getFreqPref(), LORA_BW, LORA_SF, LORA_CR);
+  radio_set_params(the_mesh.getFreqPref(), the_mesh.getBWPref(), the_mesh.getSFPref(), the_mesh.getCRPref());
   radio_set_tx_power(the_mesh.getTxPowerPref());
 
-  the_mesh.showWelcome();
+  //the_mesh.showWelcome();
+  the_mesh.checkPublicChannel();
 
   // send out initial Advertisement to the mesh
-  the_mesh.sendSelfAdvert(1200);   // add slight delay
+  the_mesh.sendSelfAdvert(1200);
 }
 
 void loop() {
