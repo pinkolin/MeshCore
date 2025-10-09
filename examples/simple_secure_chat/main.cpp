@@ -17,9 +17,13 @@
 #include <target.h>
 #include "utils.h"
 
+// Forward declaration of base64 functions (defined in BaseChatMesh.cpp via base64.hpp)
+unsigned int encode_base64(const unsigned char input[], unsigned int input_length, unsigned char output[]);
+unsigned int decode_base64(const unsigned char input[], unsigned int input_length, unsigned char output[]);
+
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "v2 (build: 4 Feb 2025)"
+#define FIRMWARE_VER_TEXT   "v3 (build: 09 Oct 2025)"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   915.0
@@ -42,6 +46,9 @@
 #endif
 
 #include <helpers/BaseChatMesh.h>
+
+// Note: MAX_GROUP_CHANNELS is defined in platformio.ini (e.g., 4)
+// We reserve 1 slot for built-in Public channel, leaving MAX_GROUP_CHANNELS-1 for user channels
 
 #define SEND_TIMEOUT_BASE_MILLIS          500
 #define FLOOD_SEND_TIMEOUT_FACTOR         16.0f
@@ -67,6 +74,13 @@ static uint32_t _atoi(const char* sp) {
 
 /* -------------------------------------------------------------------------------------- */
 
+struct UserChannel {
+  char name[32];          // channel name (or hashtag like #mychannel)
+  char key_hex[64];       // PSK as hex string (32 bytes = 64 hex chars), empty for hashtag channels
+  bool muted;             // mute notifications from this channel
+  bool active;            // is this slot used?
+};
+
 struct NodePrefs {  // persisted to file
   float airtime_factor;
   char node_name[32];
@@ -76,19 +90,331 @@ struct NodePrefs {  // persisted to file
   uint8_t sf;           // spread factor
   uint8_t cr;           // coding rate
   float bw;             // bandwidth
+  bool mute_adverts;    // mute advert notifications
+  UserChannel channels[MAX_GROUP_CHANNELS - 1];  // user-defined channels
+  int selected_channel_idx;  // currently selected channel for 'ch' command (-1 = none, 0 = public)
 };
 
 class MyMesh : public BaseChatMesh, ContactVisitor {
   FILESYSTEM* _fs;
   NodePrefs _prefs;
   uint32_t expected_ack_crc;
-  ChannelDetails* _public;
-  ChannelDetails* _test;
+  ChannelDetails* active_channels[MAX_GROUP_CHANNELS];  // +1 for built-in Public channel
+  bool channel_muted[MAX_GROUP_CHANNELS];
   unsigned long last_msg_sent;
   ContactInfo* curr_recipient;
   char command[512+10];
   uint8_t tmp_buf[256];
   char hex_buf[512];
+
+  // Helper class for collecting matching contacts
+  class AutocompleteVisitor : public ContactVisitor {
+  public:
+    const char* prefix;
+    int prefix_len;
+    char matching_names[MAX_CONTACTS][32];
+    int match_count;
+    
+    AutocompleteVisitor() : match_count(0), prefix(NULL), prefix_len(0) {}
+    
+    void reset(const char* search_prefix) {
+      prefix = search_prefix;
+      prefix_len = strlen(search_prefix);
+      match_count = 0;
+    }
+    
+    void onContactVisit(const ContactInfo& contact) override {
+      if (match_count >= MAX_CONTACTS) return;
+      
+      // Case-insensitive prefix match
+      bool match = true;
+      for (int j = 0; j < prefix_len && contact.name[j] != 0; j++) {
+        char c1 = contact.name[j];
+        char c2 = prefix[j];
+        // Convert to lowercase for comparison
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) {
+          match = false;
+          break;
+        }
+      }
+      
+      if (match && contact.name[0] != 0) {
+        strncpy(matching_names[match_count], contact.name, 32);
+        matching_names[match_count][31] = 0;
+        match_count++;
+      }
+    }
+  };
+  
+  AutocompleteVisitor autocomplete_visitor;
+
+  // Helper function to redraw the prompt with current command buffer
+  void redrawPrompt() {
+    Serial.print("\r> ");
+    Serial.print(command);  // print current command buffer
+  }
+
+  // Handle tab completion for "to" command
+  void handleTabCompletion(int& len) {
+    // Check if we're in a "to " command
+    if (len >= 3 && memcmp(command, "to ", 3) == 0) {
+      const char* prefix = &command[3];
+      
+      // Use the same mechanism as "list" command to scan contacts
+      autocomplete_visitor.reset(prefix);
+      scanRecentContacts(0, &autocomplete_visitor);  // 0 = scan all contacts
+      
+      if (autocomplete_visitor.match_count == 1) {
+        // Single match - autocomplete it
+        snprintf(&command[3], sizeof(command) - 3, "%s", autocomplete_visitor.matching_names[0]);
+        len = 3 + strlen(autocomplete_visitor.matching_names[0]);
+        command[len] = 0;
+        
+        // Redraw from beginning
+        Serial.print("\r> ");
+        Serial.print(command);
+      } else if (autocomplete_visitor.match_count > 1) {
+        // Multiple matches - show them
+        Serial.println();
+        Serial.println("Matches:");
+        for (int i = 0; i < autocomplete_visitor.match_count; i++) {
+          Serial.print("   ");
+          Serial.println(autocomplete_visitor.matching_names[i]);
+        }
+        
+        // Redraw prompt with current buffer
+        redrawPrompt();
+      } else {
+        // No matches - just beep or do nothing
+        Serial.print('\a');  // bell character (optional)
+      }
+    }
+    // Check if we're in a channel-related command: chsel, mute ch, unmute ch, del ch
+    else if ((len >= 6 && memcmp(command, "chsel ", 6) == 0) ||
+             (len >= 8 && memcmp(command, "mute ch ", 8) == 0) ||
+             (len >= 10 && memcmp(command, "unmute ch ", 10) == 0) ||
+             (len >= 7 && memcmp(command, "del ch ", 7) == 0)) {
+      
+      // Determine the prefix position
+      const char* prefix = nullptr;
+      int prefix_offset = 0;
+      if (memcmp(command, "chsel ", 6) == 0) {
+        prefix = &command[6];
+        prefix_offset = 6;
+      } else if (memcmp(command, "mute ch ", 8) == 0) {
+        prefix = &command[8];
+        prefix_offset = 8;
+      } else if (memcmp(command, "unmute ch ", 10) == 0) {
+        prefix = &command[10];
+        prefix_offset = 10;
+      } else if (memcmp(command, "del ch ", 7) == 0) {
+        prefix = &command[7];
+        prefix_offset = 7;
+      }
+      
+      // Collect matching channels
+      char matching_channels[MAX_GROUP_CHANNELS][32];
+      int match_count = 0;
+      int prefix_len = strlen(prefix);
+      
+      // Check Public channel
+      if (prefix_len == 0 || strncasecmp("Public", prefix, prefix_len) == 0) {
+        strcpy(matching_channels[match_count++], "Public");
+      }
+      
+      // Check user channels
+      for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+        if (_prefs.channels[i].active) {
+          if (prefix_len == 0 || strncasecmp(_prefs.channels[i].name, prefix, prefix_len) == 0) {
+            strcpy(matching_channels[match_count++], _prefs.channels[i].name);
+          }
+        }
+      }
+      
+      if (match_count == 1) {
+        // Single match - autocomplete it
+        snprintf(&command[prefix_offset], sizeof(command) - prefix_offset, "%s", matching_channels[0]);
+        len = prefix_offset + strlen(matching_channels[0]);
+        command[len] = 0;
+        
+        // Redraw from beginning
+        Serial.print("\r> ");
+        Serial.print(command);
+      } else if (match_count > 1) {
+        // Multiple matches - show them
+        Serial.println();
+        Serial.println("Matches:");
+        for (int i = 0; i < match_count; i++) {
+          Serial.print("   ");
+          Serial.println(matching_channels[i]);
+        }
+        
+        // Redraw prompt with current buffer
+        redrawPrompt();
+      } else {
+        // No matches
+        Serial.print('\a');  // bell character
+      }
+    }
+  }
+
+  // Helper: Find channel index in active_channels[] by name (-1 if not found, 0 = public, 1+ = user channels)
+  int findChannelByName(const char* name) {
+    if (strcasecmp(name, "public") == 0 || strcasecmp(name, "pub") == 0) {
+      return 0;  // built-in Public channel
+    }
+    
+    // Find the prefs channel with matching name and compute its base64 key
+    for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+      if (_prefs.channels[i].active && strcasecmp(_prefs.channels[i].name, name) == 0) {
+        // Found the prefs entry - now find its position in active_channels[]
+        // We need to count how many active prefs channels come before this one
+        int active_idx = 1;  // Start at 1 because 0 is Public
+        for (int j = 0; j < MAX_GROUP_CHANNELS - 1; j++) {
+          if (_prefs.channels[j].active) {
+            if (j == i) {
+              // This is our channel
+              return active_idx;
+            }
+            active_idx++;
+          }
+        }
+      }
+    }
+    return -1;
+  }
+
+  // Helper: Get channel name by active_channels[] index
+  const char* getChannelName(int idx) {
+    if (idx == 0) return "Public";
+    if (idx > 0 && idx < MAX_GROUP_CHANNELS && active_channels[idx] != nullptr) {
+      // Find which prefs entry corresponds to this active_channels index
+      // Count through active prefs channels to find the idx-th one
+      int active_count = 0;
+      for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+        if (_prefs.channels[i].active) {
+          active_count++;
+          if (active_count == idx) {
+            return _prefs.channels[i].name;
+          }
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  // Helper: Get channel name from prefs by index (works even before initChannels)
+  const char* getChannelNameFromPrefs(int idx) {
+    if (idx == 0) return "Public";
+    if (idx > 0 && idx < MAX_GROUP_CHANNELS) {
+      // Count through active prefs channels to find the idx-th one
+      int active_count = 0;
+      for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+        if (_prefs.channels[i].active) {
+          active_count++;
+          if (active_count == idx) {
+            return _prefs.channels[i].name;
+          }
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  // Helper: Add or update user channel
+  bool setUserChannel(const char* name, const char* key_hex) {
+    // Check if channel already exists
+    for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+      if (_prefs.channels[i].active && strcasecmp(_prefs.channels[i].name, name) == 0) {
+        // Update existing
+        strncpy(_prefs.channels[i].key_hex, key_hex, sizeof(_prefs.channels[i].key_hex) - 1);
+        _prefs.channels[i].key_hex[sizeof(_prefs.channels[i].key_hex) - 1] = 0;
+        return true;
+      }
+    }
+    
+    // Find empty slot
+    for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+      if (!_prefs.channels[i].active) {
+        strncpy(_prefs.channels[i].name, name, sizeof(_prefs.channels[i].name) - 1);
+        _prefs.channels[i].name[sizeof(_prefs.channels[i].name) - 1] = 0;
+        strncpy(_prefs.channels[i].key_hex, key_hex, sizeof(_prefs.channels[i].key_hex) - 1);
+        _prefs.channels[i].key_hex[sizeof(_prefs.channels[i].key_hex) - 1] = 0;
+        _prefs.channels[i].active = true;
+        _prefs.channels[i].muted = false;
+        return true;
+      }
+    }
+    return false;  // no space
+  }
+
+  // Helper: Remove user channel
+  bool removeUserChannel(const char* name) {
+    for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+      if (_prefs.channels[i].active && strcasecmp(_prefs.channels[i].name, name) == 0) {
+        _prefs.channels[i].active = false;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Helper: Convert hex string to base64 using base64 library (supports 32 or 64 hex chars)
+  void hexToBase64(char* dest, const char* hex_str, int hex_len) {
+    uint8_t bytes[32];
+    int byte_len = hex_len / 2;
+    mesh::Utils::fromHex(bytes, byte_len, hex_str);
+    unsigned int b64_len = encode_base64(bytes, byte_len, (unsigned char*)dest);
+    dest[b64_len] = 0;
+  }
+
+  // Helper: Initialize channels from prefs
+  void initChannels() {
+    // Clear all channel pointers
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+      active_channels[i] = nullptr;
+      channel_muted[i] = false;
+    }
+    
+    // Add built-in Public channel (always index 0)
+    active_channels[0] = addChannel("Public", PUBLIC_GROUP_PSK);
+    channel_muted[0] = false;
+    
+    // Add user channels from prefs - use separate counter for active_channels index
+    int active_idx = 1;  // Start at 1, because 0 is Public
+    for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+      if (_prefs.channels[i].active && active_idx < MAX_GROUP_CHANNELS) {
+        ChannelDetails* ch = nullptr;
+        if (_prefs.channels[i].name[0] == '#') {
+          // Hashtag channel - hash the name first, use first 16 bytes, then base64 encode
+          // This matches the mobile app behavior: first 16 bytes of SHA256(name) is used as the secret
+          uint8_t hash[32];
+          mesh::Utils::sha256(hash, sizeof(hash), (const uint8_t*)_prefs.channels[i].name, strlen(_prefs.channels[i].name));
+          
+          char key_b64[64];
+          unsigned int b64_len = encode_base64(hash, 16, (unsigned char*)key_b64);  // Use only first 16 bytes!
+          key_b64[b64_len] = 0;
+          ch = addChannel(_prefs.channels[i].name, key_b64);
+        } else if (_prefs.channels[i].key_hex[0] != 0) {
+          // Regular channel with hex key - convert hex to base64 for addChannel
+          int key_len = strlen(_prefs.channels[i].key_hex);
+          if (key_len == 32 || key_len == 64) {
+            char key_b64[64];
+            hexToBase64(key_b64, _prefs.channels[i].key_hex, key_len);
+            ch = addChannel(_prefs.channels[i].name, key_b64);
+          }
+        }
+        
+        if (ch != nullptr) {
+          active_channels[active_idx] = ch;
+          channel_muted[active_idx] = _prefs.channels[i].muted;
+          active_idx++;
+        }
+      }
+    }
+  }
 
   const char* getTypeName(uint8_t type) const {
     if (type == ADV_TYPE_CHAT) return "Chat";
@@ -212,12 +538,14 @@ protected:
   }
 
   void onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
-    // TODO: if not in favs,  prompt to add as fav(?)
-    Serial.print("\r\n");
-    Serial.printf("ADVERT from -> %s", contact.name);
-    Serial.printf(" | type: %s", getTypeName(contact.type));
-    Serial.print(" | public key: "); mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE); Serial.println();
-    Serial.print("\r> ");
+    if (!_prefs.mute_adverts) {
+      // TODO: if not in favs,  prompt to add as fav(?)
+      Serial.print("\r\n");
+      Serial.printf("ADVERT from -> %s", contact.name);
+      Serial.printf(" | type: %s", getTypeName(contact.type));
+      Serial.print(" | public key: "); mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE); Serial.println();
+      redrawPrompt();
+    }
 
     saveContacts();
   }
@@ -225,7 +553,7 @@ protected:
   void onContactPathUpdated(const ContactInfo& contact) override {
     Serial.print("\r\n");
     Serial.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t) contact.out_path_len);
-    Serial.print("\r> ");
+    redrawPrompt();
     saveContacts();
   }
 
@@ -233,15 +561,11 @@ protected:
     if (memcmp(data, &expected_ack_crc, 4) == 0) {     // got an ACK from recipient
       Serial.print("\r\n");
       Serial.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
-      Serial.print("\r> ");
+      redrawPrompt();
       // NOTE: the same ACK can be received multiple times!
       expected_ack_crc = 0;  // reset our expected hash, now that we have received ACK
-      return NULL;  // TODO: really should return ContactInfo pointer 
+      return curr_recipient;  // Return the recipient to cancel timeout
     }
-
-    //uint32_t crc;
-    //memcpy(&crc, data, 4);
-    //MESH_DEBUG_PRINTLN("unknown ACK received: %08X (expected: %08X)", crc, expected_ack_crc);
     return NULL;
   }
 
@@ -253,9 +577,9 @@ protected:
     removeDiacritics(text_copy);
     
     Serial.print("\r\n");  // carriage return + newline to separate from any input
-    Serial.printf("(%s) MSG -> from %s\n", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", from.name);
-    Serial.printf("   %s\n", text_copy);
-    Serial.print("\r> ");  // carriage return + prompt
+    Serial.printf("(%s) MSG -> from %s | ", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", from.name);
+    Serial.printf(": %s\n", text_copy);
+    redrawPrompt();
 
     if (strcmp(text, "clock sync") == 0) {  // special text command
       setClock(sender_timestamp + 1);
@@ -268,6 +592,22 @@ protected:
   }
 
   void onChannelMessageRecv(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t timestamp, const char *text) override {
+    // Find which channel this is
+    const char* channel_name = "UNKNOWN";
+    bool is_muted = false;
+    
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+      if (active_channels[i] && memcmp(channel.hash, active_channels[i]->channel.hash, sizeof(channel.hash)) == 0) {
+        channel_name = getChannelName(i);
+        is_muted = channel_muted[i];
+        break;
+      }
+    }
+    
+    if (is_muted) {
+      return;  // Channel is muted, don't display
+    }
+    
     // Create a mutable copy of the text to remove diacritics
     char text_copy[256];
     strncpy(text_copy, text, sizeof(text_copy) - 1);
@@ -276,20 +616,12 @@ protected:
     
     Serial.print("\r\n");  // carriage return + newline to separate from any input
     
-    // Determine channel name
-    const char* channel_name = "UNKNOWN";
-    if (_public && memcmp(channel.hash, _public->channel.hash, sizeof(channel.hash)) == 0) {
-      channel_name = "PUBLIC";
-    } else if (_test && memcmp(channel.hash, _test->channel.hash, sizeof(channel.hash)) == 0) {
-      channel_name = "TEST";
-    }
-    
     if (pkt->isRouteDirect()) {
       Serial.printf("[%s] DIRECT | %s\n", channel_name, text_copy);
     } else {
       Serial.printf("[%s] FLOOD (hops %d) | %s\n", channel_name, pkt->path_len, text_copy);
     }
-    Serial.print("\r> ");  // carriage return + prompt
+    redrawPrompt();
   }
 
   uint8_t onContactRequest(const ContactInfo& contact, uint32_t sender_timestamp, const uint8_t* data, uint8_t len, uint8_t* reply) override {
@@ -325,6 +657,16 @@ public:
     _prefs.sf = LORA_SF;
     _prefs.cr = LORA_CR;
     _prefs.bw = LORA_BW;
+    _prefs.mute_adverts = false;  // by default, show adverts
+    _prefs.selected_channel_idx = 0;  // default to Public channel
+    
+    // Initialize channels array
+    for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+      _prefs.channels[i].active = false;
+      _prefs.channels[i].name[0] = 0;
+      _prefs.channels[i].key_hex[0] = 0;
+      _prefs.channels[i].muted = false;
+    }
 
     command[0] = 0;
     curr_recipient = NULL;
@@ -380,12 +722,11 @@ public:
     }
 
     loadContacts();
-    _public = addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
-    _test = addChannel("Test", TEST_GROUP_PSK); // test channel
+    initChannels();  // Initialize all channels from prefs
   }
 
   void checkPublicChannel() {
-    if (_public == NULL) {
+    if (active_channels[0] == NULL) {
       Serial.println("ERROR: Failed to add Public channel!");
       Serial.println("This usually means base64 decoding failed or PSK has wrong length.");
       Serial.print("PSK used: "); Serial.println(PUBLIC_GROUP_PSK);
@@ -393,10 +734,13 @@ public:
       Serial.println("Public channel initialized successfully!");
     }
     
-    if (_test == NULL) {
-      Serial.println("ERROR: Failed to add Test channel!");
-    } else {
-      Serial.println("Test channel initialized successfully!");
+    // Show user channels
+    int user_ch_count = 0;
+    for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+      if (_prefs.channels[i].active) user_ch_count++;
+    }
+    if (user_ch_count > 0) {
+      Serial.printf("%d user channel(s) loaded\n", user_ch_count);
     }
   }
 
@@ -418,12 +762,17 @@ public:
   void showWelcome() {
     delay(100);  // Give serial monitor time to connect
     Serial.println();
-    Serial.println("===== MeshCore Chat Terminal =====");
+    Serial.println(" _      ____    _____ _____ ____  _     ");
+    Serial.println("/ \\__/|/   _\\  /__ __Y  __//  __\\/ \\__/|");
+    Serial.println("| |\\/|||  /      / \\ |  \\  |  \\/|| |\\/||");
+    Serial.println("| |  |||  \\__    | | |  /_ |    /| |  ||");
+    Serial.println("\\_/  \\|\\____/    \\_/ \\____\\\\_/\\_\\\\_/  \\|");
+    Serial.println("   ===== MeshCore Chat Terminal =====");
     Serial.println();
-    Serial.printf("WELCOME  %s\n", _prefs.node_name);
+    Serial.printf("WELCOME  %s\n\r", _prefs.node_name);
     mesh::Utils::printHex(Serial, self_id.pub_key, PUB_KEY_SIZE);
     Serial.println();
-    Serial.println("   (enter 'help' for basic commands)");
+    Serial.println("(enter 'help' for basic commands)");
     Serial.println();
     Serial.print("\r> ");  // initial prompt
   }
@@ -462,31 +811,15 @@ public:
       } else {
         Serial.println("   ERROR: no recipient selected (use 'to' cmd).");
       }
-    } else if (memcmp(command, "public ", 7) == 0) {  // send GroupChannel msg
-      if (_public == NULL) {
-        Serial.println("   ERROR: Public channel not initialized!");
+    } else if (memcmp(command, "ch ", 3) == 0) {  // send to selected channel
+      if (_prefs.selected_channel_idx < 0) {
+        Serial.println("   ERROR: No channel selected (use 'chsel <name>')");
         return;
       }
       
-      uint8_t temp[5+MAX_TEXT_LEN+32];
-      uint32_t timestamp = getRTCClock()->getCurrentTime();
-      memcpy(temp, &timestamp, 4);   // mostly an extra blob to help make packet_hash unique
-      temp[4] = 0;  // attempt and flags
-
-      sprintf((char *) &temp[5], "%s: %s", _prefs.node_name, &command[7]);  // <sender>: <msg>
-      temp[5 + MAX_TEXT_LEN] = 0;  // truncate if too long
-
-      int len = strlen((char *) &temp[5]);
-      auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _public->channel, temp, 5 + len);
-      if (pkt) {
-        sendFlood(pkt);
-        Serial.println("   Sent.");
-      } else {
-        Serial.println("   ERROR: unable to send");
-      }
-    } else if (memcmp(command, "test ", 5) == 0) {  // send to Test channel
-      if (_test == NULL) {
-        Serial.println("   ERROR: Test channel not initialized!");
+      ChannelDetails* ch = active_channels[_prefs.selected_channel_idx];
+      if (ch == NULL) {
+        Serial.println("   ERROR: Selected channel not initialized!");
         return;
       }
       
@@ -495,16 +828,26 @@ public:
       memcpy(temp, &timestamp, 4);
       temp[4] = 0;
 
-      sprintf((char *) &temp[5], "%s: %s", _prefs.node_name, &command[5]);
+      sprintf((char *) &temp[5], "%s: %s", _prefs.node_name, &command[3]);
       temp[5 + MAX_TEXT_LEN] = 0;
 
       int len = strlen((char *) &temp[5]);
-      auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _test->channel, temp, 5 + len);
+      auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch->channel, temp, 5 + len);
       if (pkt) {
         sendFlood(pkt);
-        Serial.println("   Sent to Test channel.");
+        Serial.printf("   Sent to [%s]\n", getChannelName(_prefs.selected_channel_idx));
       } else {
         Serial.println("   ERROR: unable to send");
+      }
+    } else if (memcmp(command, "chsel ", 6) == 0) {  // select channel
+      const char* ch_name = &command[6];
+      int idx = findChannelByName(ch_name);
+      if (idx >= 0) {
+        _prefs.selected_channel_idx = idx;
+        savePrefs();
+        Serial.printf("   Channel '%s' selected\n", getChannelName(idx));
+      } else {
+        Serial.println("   ERROR: Channel not found");
       }
     } else if (memcmp(command, "list", 4) == 0) {  // show Contact list, by most recent
       int n = 0;
@@ -562,6 +905,53 @@ public:
       }
     } else if (memcmp(command, "import ", 7) == 0) {
       importCard(&command[7]);
+    } else if (memcmp(command, "set ch ", 7) == 0) {  // set ch <name> <hex_key> - MUST be before "set "
+      const char* params = &command[7];
+      char ch_name[32];
+      char hex_key[65] = {0};
+      
+      // Check if it's a hashtag channel
+      if (params[0] == '#') {
+        if (sscanf(params, "%31s", ch_name) == 1) {
+          // Hashtag channel - no key needed, just name
+          if (setUserChannel(ch_name, "")) {
+            savePrefs();
+            Serial.printf("   Channel '%s' added (hashtag) - reboot to activate\n", ch_name);
+          } else {
+            Serial.println("   ERROR: Channel limit reached");
+          }
+        } else {
+          Serial.println("   Usage: set ch #<name>  (for hashtag channel)");
+        }
+      } else if (sscanf(params, "%31s %64s", ch_name, hex_key) == 2) {
+        // Regular channel with hex key (supports 128-bit or 256-bit keys)
+        int key_len = strlen(hex_key);
+        if (key_len == 32 || key_len == 64) {
+          // Validate hex
+          bool valid_hex = true;
+          for (int i = 0; i < key_len; i++) {
+            if (!mesh::Utils::isHexChar(hex_key[i])) {
+              valid_hex = false;
+              break;
+            }
+          }
+          if (valid_hex) {
+            if (setUserChannel(ch_name, hex_key)) {
+              savePrefs();
+              Serial.printf("   Channel '%s' added (%d-bit) - reboot to activate\n", ch_name, key_len * 4);
+            } else {
+              Serial.println("   ERROR: Channel limit reached");
+            }
+          } else {
+            Serial.println("   ERROR: Invalid hex key");
+          }
+        } else {
+          Serial.println("   ERROR: Key must be 32 (128-bit) or 64 (256-bit) hex characters");
+        }
+      } else {
+        Serial.println("   Usage: set ch <name> <hex_key>  (32 or 64 hex chars)");
+        Serial.println("          set ch #<name>           (hashtag channel)");
+      }
     } else if (memcmp(command, "set ", 4) == 0) {
       const char* config = &command[4];
       if (memcmp(config, "af ", 3) == 0) {
@@ -635,9 +1025,87 @@ public:
         if (show_all || strcmp(param, "af") == 0) {
           Serial.print("  af:   "); Serial.println(_prefs.airtime_factor, 2);
         }
+        if (show_all || strcmp(param, "ch") == 0) {
+          Serial.println("  Channels:");
+          Serial.printf("    [0] Public%s%s\r\n", 
+            _prefs.selected_channel_idx == 0 ? " *" : "",
+            channel_muted[0] ? " (muted)" : "");
+          for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
+            if (_prefs.channels[i].active) {
+              Serial.printf("    [%d] %s%s%s\r\n", 
+                i + 1, 
+                _prefs.channels[i].name,
+                _prefs.selected_channel_idx == (i + 1) ? " *" : "",
+                channel_muted[i + 1] ? " (muted)" : "");
+            }
+          }
+        }
+      }
+    } else if (memcmp(command, "del ch ", 7) == 0) {  // del ch <name>
+      const char* ch_name = &command[7];
+      if (strcasecmp(ch_name, "public") == 0) {
+        Serial.println("   ERROR: Cannot delete Public channel");
+      } else if (removeUserChannel(ch_name)) {
+        // Reset to Public if we deleted selected channel
+        const char* selected_name = getChannelNameFromPrefs(_prefs.selected_channel_idx);
+        if (selected_name && strcasecmp(selected_name, ch_name) == 0) {
+          _prefs.selected_channel_idx = 0;
+        }
+        savePrefs();
+        Serial.printf("   Channel '%s' removed - reboot to apply\n", ch_name);
+      } else {
+        Serial.println("   ERROR: Channel not found");
       }
     } else if (memcmp(command, "ver", 3) == 0) {
       Serial.println(FIRMWARE_VER_TEXT);
+    } else if (memcmp(command, "mute ch ", 8) == 0) {  // mute ch <name>
+      const char* ch_name = &command[8];
+      int idx = findChannelByName(ch_name);
+      if (idx >= 0) {
+        channel_muted[idx] = true;
+        if (idx > 0) {
+          _prefs.channels[idx - 1].muted = true;
+        }
+        savePrefs();
+        Serial.printf("   Channel '%s' muted\n", getChannelName(idx));
+      } else {
+        Serial.println("   ERROR: Channel not found");
+      }
+    } else if (memcmp(command, "unmute ch ", 10) == 0) {  // unmute ch <name>
+      const char* ch_name = &command[10];
+      int idx = findChannelByName(ch_name);
+      if (idx >= 0) {
+        channel_muted[idx] = false;
+        if (idx > 0) {
+          _prefs.channels[idx - 1].muted = false;
+        }
+        savePrefs();
+        Serial.printf("   Channel '%s' unmuted\n", getChannelName(idx));
+      } else {
+        Serial.println("   ERROR: Channel not found");
+      }
+    } else if (memcmp(command, "mute", 4) == 0) {
+      if (command[4] == 0 || command[4] == ' ') {  // "mute" or "mute <type>"
+        const char* type = (command[4] == ' ') ? &command[5] : "advert";
+        if (strcmp(type, "advert") == 0) {
+          _prefs.mute_adverts = true;
+          savePrefs();
+          Serial.println("   ADVERT messages muted");
+        } else {
+          Serial.println("   ERROR: unknown mute type (try: advert, or 'ch <name>')");
+        }
+      }
+    } else if (memcmp(command, "unmute", 6) == 0) {
+      if (command[6] == 0 || command[6] == ' ') {  // "unmute" or "unmute <type>"
+        const char* type = (command[6] == ' ') ? &command[7] : "advert";
+        if (strcmp(type, "advert") == 0) {
+          _prefs.mute_adverts = false;
+          savePrefs();
+          Serial.println("   ADVERT messages unmuted");
+        } else {
+          Serial.println("   ERROR: unknown unmute type (try: advert, or 'ch <name>')");
+        }
+      }
     } else if (memcmp(command, "reboot", 6) == 0) {
       Serial.println("Rebooting...");
       Serial.flush();  // ensure message is sent before reboot
@@ -646,20 +1114,32 @@ public:
     } else if (memcmp(command, "help", 4) == 0) {
       Serial.println("Commands:");
       Serial.println("   set {name|lat|lon|freq|tx|sf|cr|bw|af} {value}");
-      Serial.println("   get [{name|lat|lon|freq|tx|sf|cr|bw|af}]");
+      Serial.println("   set ch <name> <hex_key>  - add channel (32 or 64 hex chars)");
+      Serial.println("   set ch #<name>           - add hashtag channel");
+      Serial.println("   get [{name|lat|lon|freq|tx|sf|cr|bw|af|ch}]");
+      Serial.println("   del ch <name>            - delete channel");
       Serial.println("   card");
       Serial.println("   import {biz card}");
       Serial.println("   clock");
       Serial.println("   time <epoch-seconds>");
       Serial.println("   list {n}");
       Serial.println("   to <recipient name or prefix>");
+      Serial.println("      (use TAB to autocomplete contact names)");
       Serial.println("   to");
       Serial.println("   send <text>");
+      Serial.println("   chsel <name>             - select channel");
+      Serial.println("   ch <text>                - send to selected channel");
+      Serial.println("   mute ch <name>           - mute channel");
+      Serial.println("   unmute ch <name>         - unmute channel");
+      Serial.println("   mute [advert]");
+      Serial.println("   unmute [advert]");
       Serial.println("   advert");
       Serial.println("   reset path");
-      Serial.println("   public <text>");
-      Serial.println("   test <text>");
       Serial.println("   reboot");
+      Serial.println();
+      Serial.println("Keyboard shortcuts:");
+      Serial.println("   TAB - autocomplete contact name after 'to '");
+      Serial.println("   ESC - clear current input line");
     } else {
       Serial.print("   ERROR: unknown command: "); Serial.println(command);
     }
@@ -680,6 +1160,20 @@ public:
           command[0] = 0;  // reset
           len = 0;
         }
+      } else if (c == '\t' || c == 9) {  // Tab key for autocomplete
+        command[len] = 0;  // ensure null termination
+        handleTabCompletion(len);
+      } else if (c == 27) {  // Escape key - clear current command
+        // Clear the current line by overwriting with spaces
+        Serial.print('\r');
+        for (int i = 0; i < len + 2; i++) {  // +2 for "> "
+          Serial.print(' ');
+        }
+        // Reset command buffer
+        command[0] = 0;
+        len = 0;
+        // Show fresh prompt
+        Serial.print("\r> ");
       } else if (c == 8 || c == 127) {  // backspace or delete
         if (len > 0) {
           len--;
@@ -702,7 +1196,7 @@ public:
 
 StdRNG fast_rng;
 SimpleMeshTables tables;
-MyMesh the_mesh(radio_driver, fast_rng, *new VolatileRTCClock(), tables); // TODO: test with 'rtc_clock' in target.cpp
+MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables);
 
 void halt() {
   while (1) ;
@@ -736,8 +1230,7 @@ void setup() {
   radio_set_params(the_mesh.getFreqPref(), the_mesh.getBWPref(), the_mesh.getSFPref(), the_mesh.getCRPref());
   radio_set_tx_power(the_mesh.getTxPowerPref());
 
-  //the_mesh.showWelcome();
-  the_mesh.checkPublicChannel();
+  the_mesh.showWelcome();
 
   // send out initial Advertisement to the mesh
   the_mesh.sendSelfAdvert(1200);
