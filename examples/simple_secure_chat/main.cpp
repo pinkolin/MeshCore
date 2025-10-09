@@ -74,6 +74,120 @@ static uint32_t _atoi(const char* sp) {
 
 /* -------------------------------------------------------------------------------------- */
 
+// Dynamic MultiSerial Wrapper - broadcasts output to enabled serial ports
+class MultiSerial : public Stream {
+private:
+  struct SerialPort {
+    Stream* serial;  // Use Stream* instead of HardwareSerial* for compatibility
+    bool enabled;
+    const char* name;
+  };
+  
+  SerialPort ports[3];  // Serial, Serial1, Serial2
+  
+public:
+  MultiSerial() {
+    // Initialize with USB Serial always enabled
+    ports[0].serial = &Serial;
+    ports[0].enabled = true;
+    ports[0].name = "USB";
+    
+    ports[1].serial = &Serial1;
+    ports[1].enabled = false;
+    ports[1].name = "Serial1";
+    
+    ports[2].serial = &Serial2;
+    ports[2].enabled = false;
+    ports[2].name = "Serial2";
+  }
+  
+  void enablePort(int idx) {
+    if (idx >= 0 && idx < 3) {
+      ports[idx].enabled = true;
+      // Initialize hardware serial ports (Serial1, Serial2)
+      // Note: Serial (USB) is already initialized in setup()
+      if (idx == 1) {
+        Serial1.begin(SERIAL_BAUD);
+      } else if (idx == 2) {
+        Serial2.begin(SERIAL_BAUD);
+      }
+    }
+  }
+  
+  void disablePort(int idx) {
+    if (idx > 0 && idx < 3) {  // Cannot disable port 0 (USB)
+      ports[idx].enabled = false;
+      // Stop hardware serial to free resources and prevent interference
+      if (idx == 1) {
+        Serial1.end();
+      } else if (idx == 2) {
+        Serial2.end();
+      }
+    }
+  }
+  
+  bool isEnabled(int idx) {
+    return (idx >= 0 && idx < 3) ? ports[idx].enabled : false;
+  }
+  
+  const char* getPortName(int idx) {
+    return (idx >= 0 && idx < 3) ? ports[idx].name : "Unknown";
+  }
+  
+  // Stream interface
+  int available() override {
+    for (int i = 0; i < 3; i++) {
+      if (ports[i].enabled && ports[i].serial->available()) {
+        return ports[i].serial->available();
+      }
+    }
+    return 0;
+  }
+  
+  int read() override {
+    for (int i = 0; i < 3; i++) {
+      if (ports[i].enabled && ports[i].serial->available()) {
+        return ports[i].serial->read();
+      }
+    }
+    return -1;
+  }
+  
+  int peek() override {
+    for (int i = 0; i < 3; i++) {
+      if (ports[i].enabled && ports[i].serial->available()) {
+        return ports[i].serial->peek();
+      }
+    }
+    return -1;
+  }
+  
+  size_t write(uint8_t c) override {
+    for (int i = 0; i < 3; i++) {
+      if (ports[i].enabled) {
+        // For USB (port 0), always write immediately
+        // For hardware serial (ports 1-2), only write if buffer has space to avoid blocking
+        if (i == 0 || ports[i].serial->availableForWrite() > 0) {
+          ports[i].serial->write(c);
+        }
+      }
+    }
+    return 1;
+  }
+  
+  void flush() override {
+    for (int i = 0; i < 3; i++) {
+      if (ports[i].enabled) {
+        ports[i].serial->flush();
+      }
+    }
+  }
+};
+
+MultiSerial Console;  // Global multi-serial wrapper
+
+/* -------------------------------------------------------------------------------------- */
+
 struct UserChannel {
   char name[32];          // channel name (or hashtag like #mychannel)
   char key_hex[64];       // PSK as hex string (32 bytes = 64 hex chars), empty for hashtag channels
@@ -93,6 +207,7 @@ struct NodePrefs {  // persisted to file
   bool mute_adverts;    // mute advert notifications
   UserChannel channels[MAX_GROUP_CHANNELS - 1];  // user-defined channels
   int selected_channel_idx;  // currently selected channel for 'ch' command (-1 = none, 0 = public)
+  bool serial_enabled[3];  // serial ports enabled state (0=USB, 1=Serial1, 2=Serial2)
 };
 
 class MyMesh : public BaseChatMesh, ContactVisitor {
@@ -152,8 +267,8 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
 
   // Helper function to redraw the prompt with current command buffer
   void redrawPrompt() {
-    Serial.print("\r> ");
-    Serial.print(command);  // print current command buffer
+    Console.print("\r> ");
+    Console.print(command);  // print current command buffer
   }
 
   // Handle tab completion for "to" command
@@ -173,22 +288,22 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
         command[len] = 0;
         
         // Redraw from beginning
-        Serial.print("\r> ");
-        Serial.print(command);
+        Console.print("\r> ");
+        Console.print(command);
       } else if (autocomplete_visitor.match_count > 1) {
         // Multiple matches - show them
-        Serial.println();
-        Serial.println("Matches:");
+        Console.println();
+        Console.println("Matches:");
         for (int i = 0; i < autocomplete_visitor.match_count; i++) {
-          Serial.print("   ");
-          Serial.println(autocomplete_visitor.matching_names[i]);
+          Console.print("   ");
+          Console.println(autocomplete_visitor.matching_names[i]);
         }
         
         // Redraw prompt with current buffer
         redrawPrompt();
       } else {
         // No matches - just beep or do nothing
-        Serial.print('\a');  // bell character (optional)
+        Console.print('\a');  // bell character (optional)
       }
     }
     // Check if we're in a channel-related command: chsel, mute ch, unmute ch, del ch
@@ -240,22 +355,22 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
         command[len] = 0;
         
         // Redraw from beginning
-        Serial.print("\r> ");
-        Serial.print(command);
+        Console.print("\r> ");
+        Console.print(command);
       } else if (match_count > 1) {
         // Multiple matches - show them
-        Serial.println();
-        Serial.println("Matches:");
+        Console.println();
+        Console.println("Matches:");
         for (int i = 0; i < match_count; i++) {
-          Serial.print("   ");
-          Serial.println(matching_channels[i]);
+          Console.print("   ");
+          Console.println(matching_channels[i]);
         }
         
         // Redraw prompt with current buffer
         redrawPrompt();
       } else {
         // No matches
-        Serial.print('\a');  // bell character
+        Console.print('\a');  // bell character
       }
     }
   }
@@ -496,9 +611,9 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     uint32_t curr = getRTCClock()->getCurrentTime();
     if (timestamp > curr) {
       getRTCClock()->setCurrentTime(timestamp);
-      Serial.println("   (OK - clock set!)");
+      Console.println("   (OK - clock set!)");
     } else {
-      Serial.println("   (ERR: clock cannot go backwards)");
+      Console.println("   (ERR: clock cannot go backwards)");
     }
   }
 
@@ -521,7 +636,7 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
         }
       }
     }
-    Serial.println("   error: invalid format");
+    Console.println("   error: invalid format");
   }
 
 protected:
@@ -540,10 +655,10 @@ protected:
   void onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
     if (!_prefs.mute_adverts) {
       // TODO: if not in favs,  prompt to add as fav(?)
-      Serial.print("\r\n");
-      Serial.printf("ADVERT from -> %s", contact.name);
-      Serial.printf(" | type: %s", getTypeName(contact.type));
-      Serial.print(" | public key: "); mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE); Serial.println();
+      Console.print("\r\n");
+      Console.printf("ADVERT from -> %s", contact.name);
+      Console.printf(" | type: %s", getTypeName(contact.type));
+      Console.print(" | public key: "); mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE); Console.println();
       redrawPrompt();
     }
 
@@ -551,16 +666,16 @@ protected:
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
-    Serial.print("\r\n");
-    Serial.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t) contact.out_path_len);
+    Console.print("\r\n");
+    Console.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t) contact.out_path_len);
     redrawPrompt();
     saveContacts();
   }
 
   ContactInfo* processAck(const uint8_t *data) override {
     if (memcmp(data, &expected_ack_crc, 4) == 0) {     // got an ACK from recipient
-      Serial.print("\r\n");
-      Serial.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
+      Console.print("\r\n");
+      Console.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
       redrawPrompt();
       // NOTE: the same ACK can be received multiple times!
       expected_ack_crc = 0;  // reset our expected hash, now that we have received ACK
@@ -576,9 +691,9 @@ protected:
     text_copy[sizeof(text_copy) - 1] = 0;
     removeDiacritics(text_copy);
     
-    Serial.print("\r\n");  // carriage return + newline to separate from any input
-    Serial.printf("(%s) MSG -> from %s | ", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", from.name);
-    Serial.printf(": %s\n", text_copy);
+    Console.print("\r\n");  // carriage return + newline to separate from any input
+    Console.printf("(%s) MSG -> from %s | ", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", from.name);
+    Console.printf(": %s\n", text_copy);
     redrawPrompt();
 
     if (strcmp(text, "clock sync") == 0) {  // special text command
@@ -614,12 +729,12 @@ protected:
     text_copy[sizeof(text_copy) - 1] = 0;
     removeDiacritics(text_copy);
     
-    Serial.print("\r\n");  // carriage return + newline to separate from any input
+    Console.print("\r\n");  // carriage return + newline to separate from any input
     
     if (pkt->isRouteDirect()) {
-      Serial.printf("[%s] DIRECT | %s\n", channel_name, text_copy);
+      Console.printf("[%s] DIRECT | %s\n", channel_name, text_copy);
     } else {
-      Serial.printf("[%s] FLOOD (hops %d) | %s\n", channel_name, pkt->path_len, text_copy);
+      Console.printf("[%s] FLOOD (hops %d) | %s\n", channel_name, pkt->path_len, text_copy);
     }
     redrawPrompt();
   }
@@ -641,7 +756,7 @@ protected:
   }
 
   void onSendTimeout() override {
-    Serial.println("   ERROR: timed out, no ACK.");
+    Console.println("   ERROR: timed out, no ACK.");
   }
 
 public:
@@ -659,6 +774,11 @@ public:
     _prefs.bw = LORA_BW;
     _prefs.mute_adverts = false;  // by default, show adverts
     _prefs.selected_channel_idx = 0;  // default to Public channel
+    
+    // Initialize serial ports state (default: only USB enabled)
+    _prefs.serial_enabled[0] = true;   // USB always enabled
+    _prefs.serial_enabled[1] = false;  // Serial1 disabled by default
+    _prefs.serial_enabled[2] = false;  // Serial2 disabled by default
     
     // Initialize channels array
     for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
@@ -693,10 +813,10 @@ public:
   #endif
     if (!store.load("_main", self_id, _prefs.node_name, sizeof(_prefs.node_name))) {  // legacy: node_name was from identity file
       // Need way to get some entropy to seed RNG
-      Serial.println("Press ENTER to generate key:");
+      Console.println("Press ENTER to generate key:");
       char c = 0;
       while (c != '\n') {   // wait for ENTER to be pressed
-        if (Serial.available()) c = Serial.read();
+        if (Console.available()) c = Console.read();
       }
       ((StdRNG *)getRNG())->begin(millis());
 
@@ -723,15 +843,22 @@ public:
 
     loadContacts();
     initChannels();  // Initialize all channels from prefs
+    
+    // Apply saved serial port configuration
+    for (int i = 0; i < 3; i++) {
+      if (_prefs.serial_enabled[i]) {
+        Console.enablePort(i);
+      }
+    }
   }
 
   void checkPublicChannel() {
     if (active_channels[0] == NULL) {
-      Serial.println("ERROR: Failed to add Public channel!");
-      Serial.println("This usually means base64 decoding failed or PSK has wrong length.");
-      Serial.print("PSK used: "); Serial.println(PUBLIC_GROUP_PSK);
+      Console.println("ERROR: Failed to add Public channel!");
+      Console.println("This usually means base64 decoding failed or PSK has wrong length.");
+      Console.print("PSK used: "); Console.println(PUBLIC_GROUP_PSK);
     } else {
-      Serial.println("Public channel initialized successfully!");
+      Console.println("Public channel initialized successfully!");
     }
     
     // Show user channels
@@ -740,7 +867,7 @@ public:
       if (_prefs.channels[i].active) user_ch_count++;
     }
     if (user_ch_count > 0) {
-      Serial.printf("%d user channel(s) loaded\n", user_ch_count);
+      Console.printf("%d user channel(s) loaded\n", user_ch_count);
     }
   }
 
@@ -761,20 +888,20 @@ public:
 
   void showWelcome() {
     delay(100);  // Give serial monitor time to connect
-    Serial.println();
-    Serial.println(" _      ____    _____ _____ ____  _     ");
-    Serial.println("/ \\__/|/   _\\  /__ __Y  __//  __\\/ \\__/|");
-    Serial.println("| |\\/|||  /      / \\ |  \\  |  \\/|| |\\/||");
-    Serial.println("| |  |||  \\__    | | |  /_ |    /| |  ||");
-    Serial.println("\\_/  \\|\\____/    \\_/ \\____\\\\_/\\_\\\\_/  \\|");
-    Serial.println("   ===== MeshCore Chat Terminal =====");
-    Serial.println();
-    Serial.printf("WELCOME  %s\n\r", _prefs.node_name);
+    Console.println();
+    Console.println(" _      ____    _____ _____ ____  _     ");
+    Console.println("/ \\__/|/   _\\  /__ __Y  __//  __\\/ \\__/|");
+    Console.println("| |\\/|||  /      / \\ |  \\  |  \\/|| |\\/||");
+    Console.println("| |  |||  \\__    | | |  /_ |    /| |  ||");
+    Console.println("\\_/  \\|\\____/    \\_/ \\____\\\\_/\\_\\\\_/  \\|");
+    Console.println("   ===== MeshCore Chat Terminal =====");
+    Console.println();
+    Console.printf("WELCOME  %s\n\r", _prefs.node_name);
     mesh::Utils::printHex(Serial, self_id.pub_key, PUB_KEY_SIZE);
-    Serial.println();
-    Serial.println("(enter 'help' for basic commands)");
-    Serial.println();
-    Serial.print("\r> ");  // initial prompt
+    Console.println();
+    Console.println("(enter 'help' for basic commands)");
+    Console.println();
+    Console.print("\r> ");  // initial prompt
   }
 
   void sendSelfAdvert(int delay_millis) {
@@ -786,11 +913,11 @@ public:
 
   // ContactVisitor
   void onContactVisit(const ContactInfo& contact) override {
-    Serial.printf("   %s - ", contact.name);
+    Console.printf("   %s - ", contact.name);
     char tmp[40];
     int32_t secs = contact.last_advert_timestamp - getRTCClock()->getCurrentTime();
     AdvertTimeHelper::formatRelativeTimeDiff(tmp, secs, false);
-    Serial.println(tmp);
+    Console.println(tmp);
   }
 
   void handleCommand(const char* command) {
@@ -803,23 +930,23 @@ public:
 
         int result = sendMessage(*curr_recipient, getRTCClock()->getCurrentTime(), 0, text, expected_ack_crc, est_timeout);
         if (result == MSG_SEND_FAILED) {
-          Serial.println("   ERROR: unable to send.");
+          Console.println("   ERROR: unable to send.");
         } else {
           last_msg_sent = _ms->getMillis();
-          Serial.printf("   (message sent - %s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
+          Console.printf("   (message sent - %s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
         }
       } else {
-        Serial.println("   ERROR: no recipient selected (use 'to' cmd).");
+        Console.println("   ERROR: no recipient selected (use 'to' cmd).");
       }
     } else if (memcmp(command, "ch ", 3) == 0) {  // send to selected channel
       if (_prefs.selected_channel_idx < 0) {
-        Serial.println("   ERROR: No channel selected (use 'chsel <name>')");
+        Console.println("   ERROR: No channel selected (use 'chsel <name>')");
         return;
       }
       
       ChannelDetails* ch = active_channels[_prefs.selected_channel_idx];
       if (ch == NULL) {
-        Serial.println("   ERROR: Selected channel not initialized!");
+        Console.println("   ERROR: Selected channel not initialized!");
         return;
       }
       
@@ -835,9 +962,9 @@ public:
       auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch->channel, temp, 5 + len);
       if (pkt) {
         sendFlood(pkt);
-        Serial.printf("   Sent to [%s]\n", getChannelName(_prefs.selected_channel_idx));
+        Console.printf("   Sent to [%s]\n", getChannelName(_prefs.selected_channel_idx));
       } else {
-        Serial.println("   ERROR: unable to send");
+        Console.println("   ERROR: unable to send");
       }
     } else if (memcmp(command, "chsel ", 6) == 0) {  // select channel
       const char* ch_name = &command[6];
@@ -845,9 +972,9 @@ public:
       if (idx >= 0) {
         _prefs.selected_channel_idx = idx;
         savePrefs();
-        Serial.printf("   Channel '%s' selected\n", getChannelName(idx));
+        Console.printf("   Channel '%s' selected\n", getChannelName(idx));
       } else {
-        Serial.println("   ERROR: Channel not found");
+        Console.println("   ERROR: Channel not found");
       }
     } else if (memcmp(command, "list", 4) == 0) {  // show Contact list, by most recent
       int n = 0;
@@ -858,50 +985,50 @@ public:
     } else if (strcmp(command, "clock") == 0) {    // show current time
       uint32_t now = getRTCClock()->getCurrentTime();
       DateTime dt = DateTime(now);
-      Serial.printf(   "%02d:%02d - %d/%d/%d UTC\n", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+      Console.printf(   "%02d:%02d - %d/%d/%d UTC\n", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
     } else if (memcmp(command, "time ", 5) == 0) {  // set time (to epoch seconds)
       uint32_t secs = _atoi(&command[5]);
       setClock(secs);
     } else if (memcmp(command, "to ", 3) == 0) {  // set current recipient
       curr_recipient = searchContactsByPrefix(&command[3]);
       if (curr_recipient) {
-        Serial.printf("   Recipient %s now selected.\n", curr_recipient->name);
+        Console.printf("   Recipient %s now selected.\n", curr_recipient->name);
       } else {
-        Serial.println("   Error: Name prefix not found.");
+        Console.println("   Error: Name prefix not found.");
       }
     } else if (strcmp(command, "to") == 0) {    // show current recipient
       if (curr_recipient) {
-         Serial.printf("   Current: %s\n", curr_recipient->name);
+         Console.printf("   Current: %s\n", curr_recipient->name);
       } else {
-         Serial.println("   Err: no recipient selected");
+         Console.println("   Err: no recipient selected");
       }
     } else if (strcmp(command, "advert") == 0) {
       auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
       if (pkt) {
         sendZeroHop(pkt);
-        Serial.println("   (advert sent, zero hop).");
+        Console.println("   (advert sent, zero hop).");
       } else {
-        Serial.println("   ERR: unable to send");
+        Console.println("   ERR: unable to send");
       }
     } else if (strcmp(command, "reset path") == 0) {
       if (curr_recipient) {
         resetPathTo(*curr_recipient);
         saveContacts();
-        Serial.println("   Done.");
+        Console.println("   Done.");
       }
     } else if (memcmp(command, "card", 4) == 0) {
-      Serial.printf("Hello %s\n", _prefs.node_name);
+      Console.printf("Hello %s\n", _prefs.node_name);
       auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
       if (pkt) {
         uint8_t len =  pkt->writeTo(tmp_buf);
         releasePacket(pkt);  // undo the obtainNewPacket()
 
         mesh::Utils::toHex(hex_buf, tmp_buf, len);
-        Serial.println("Your MeshCore biz card:");
-        Serial.print("meshcore://"); Serial.println(hex_buf);
-        Serial.println();
+        Console.println("Your MeshCore biz card:");
+        Console.print("meshcore://"); Console.println(hex_buf);
+        Console.println();
       } else {
-        Serial.println("  Error");
+        Console.println("  Error");
       }
     } else if (memcmp(command, "import ", 7) == 0) {
       importCard(&command[7]);
@@ -916,12 +1043,12 @@ public:
           // Hashtag channel - no key needed, just name
           if (setUserChannel(ch_name, "")) {
             savePrefs();
-            Serial.printf("   Channel '%s' added (hashtag) - reboot to activate\n", ch_name);
+            Console.printf("   Channel '%s' added (hashtag) - reboot to activate\n", ch_name);
           } else {
-            Serial.println("   ERROR: Channel limit reached");
+            Console.println("   ERROR: Channel limit reached");
           }
         } else {
-          Serial.println("   Usage: set ch #<name>  (for hashtag channel)");
+          Console.println("   Usage: set ch #<name>  (for hashtag channel)");
         }
       } else if (sscanf(params, "%31s %64s", ch_name, hex_key) == 2) {
         // Regular channel with hex key (supports 128-bit or 256-bit keys)
@@ -938,60 +1065,60 @@ public:
           if (valid_hex) {
             if (setUserChannel(ch_name, hex_key)) {
               savePrefs();
-              Serial.printf("   Channel '%s' added (%d-bit) - reboot to activate\n", ch_name, key_len * 4);
+              Console.printf("   Channel '%s' added (%d-bit) - reboot to activate\n", ch_name, key_len * 4);
             } else {
-              Serial.println("   ERROR: Channel limit reached");
+              Console.println("   ERROR: Channel limit reached");
             }
           } else {
-            Serial.println("   ERROR: Invalid hex key");
+            Console.println("   ERROR: Invalid hex key");
           }
         } else {
-          Serial.println("   ERROR: Key must be 32 (128-bit) or 64 (256-bit) hex characters");
+          Console.println("   ERROR: Key must be 32 (128-bit) or 64 (256-bit) hex characters");
         }
       } else {
-        Serial.println("   Usage: set ch <name> <hex_key>  (32 or 64 hex chars)");
-        Serial.println("          set ch #<name>           (hashtag channel)");
+        Console.println("   Usage: set ch <name> <hex_key>  (32 or 64 hex chars)");
+        Console.println("          set ch #<name>           (hashtag channel)");
       }
     } else if (memcmp(command, "set ", 4) == 0) {
       const char* config = &command[4];
       if (memcmp(config, "af ", 3) == 0) {
         _prefs.airtime_factor = atof(&config[3]);
         savePrefs();
-        Serial.println("  OK");
+        Console.println("  OK");
       } else if (memcmp(config, "name ", 5) == 0) {
         StrHelper::strncpy(_prefs.node_name, &config[5], sizeof(_prefs.node_name));
         savePrefs();
-        Serial.println("  OK");
+        Console.println("  OK");
       } else if (memcmp(config, "lat ", 4) == 0) {
         _prefs.node_lat = atof(&config[4]);
         savePrefs();
-        Serial.println("  OK");
+        Console.println("  OK");
       } else if (memcmp(config, "lon ", 4) == 0) {
         _prefs.node_lon = atof(&config[4]);
         savePrefs();
-        Serial.println("  OK");
+        Console.println("  OK");
       } else if (memcmp(config, "tx ", 3) == 0) {
         _prefs.tx_power_dbm = atoi(&config[3]);
         savePrefs();
-        Serial.println("  OK - reboot to apply");
+        Console.println("  OK - reboot to apply");
       } else if (memcmp(config, "freq ", 5) == 0) {
         _prefs.freq = atof(&config[5]);
         savePrefs();
-        Serial.println("  OK - reboot to apply");
+        Console.println("  OK - reboot to apply");
       } else if (memcmp(config, "sf ", 3) == 0) {
         _prefs.sf = atoi(&config[3]);
         savePrefs();
-        Serial.println("  OK - reboot to apply");
+        Console.println("  OK - reboot to apply");
       } else if (memcmp(config, "cr ", 3) == 0) {
         _prefs.cr = atoi(&config[3]);
         savePrefs();
-        Serial.println("  OK - reboot to apply");
+        Console.println("  OK - reboot to apply");
       } else if (memcmp(config, "bw ", 3) == 0) {
         _prefs.bw = atof(&config[3]);
         savePrefs();
-        Serial.println("  OK - reboot to apply");
+        Console.println("  OK - reboot to apply");
       } else {
-        Serial.printf("  ERROR: unknown config: %s\n", config);
+        Console.printf("  ERROR: unknown config: %s\n", config);
       }
     } else if (memcmp(command, "get", 3) == 0) {
       if (command[3] == 0 || command[3] == ' ') {  // "get" or "get <param>"
@@ -999,40 +1126,40 @@ public:
         bool show_all = (param[0] == 0);
         
         if (show_all || strcmp(param, "name") == 0) {
-          Serial.print("  name: "); Serial.println(_prefs.node_name);
+          Console.print("  name: "); Console.println(_prefs.node_name);
         }
         if (show_all || strcmp(param, "lat") == 0) {
-          Serial.print("  lat:  "); Serial.println(_prefs.node_lat, 6);
+          Console.print("  lat:  "); Console.println(_prefs.node_lat, 6);
         }
         if (show_all || strcmp(param, "lon") == 0) {
-          Serial.print("  lon:  "); Serial.println(_prefs.node_lon, 6);
+          Console.print("  lon:  "); Console.println(_prefs.node_lon, 6);
         }
         if (show_all || strcmp(param, "freq") == 0) {
-          Serial.print("  freq: "); Serial.print(_prefs.freq, 3); Serial.println(" MHz");
+          Console.print("  freq: "); Console.print(_prefs.freq, 3); Console.println(" MHz");
         }
         if (show_all || strcmp(param, "tx") == 0) {
-          Serial.print("  tx:   "); Serial.print(_prefs.tx_power_dbm); Serial.println(" dBm");
+          Console.print("  tx:   "); Console.print(_prefs.tx_power_dbm); Console.println(" dBm");
         }
         if (show_all || strcmp(param, "sf") == 0) {
-          Serial.print("  sf:   "); Serial.println(_prefs.sf);
+          Console.print("  sf:   "); Console.println(_prefs.sf);
         }
         if (show_all || strcmp(param, "cr") == 0) {
-          Serial.print("  cr:   "); Serial.println(_prefs.cr);
+          Console.print("  cr:   "); Console.println(_prefs.cr);
         }
         if (show_all || strcmp(param, "bw") == 0) {
-          Serial.print("  bw:   "); Serial.print(_prefs.bw, 1); Serial.println(" kHz");
+          Console.print("  bw:   "); Console.print(_prefs.bw, 1); Console.println(" kHz");
         }
         if (show_all || strcmp(param, "af") == 0) {
-          Serial.print("  af:   "); Serial.println(_prefs.airtime_factor, 2);
+          Console.print("  af:   "); Console.println(_prefs.airtime_factor, 2);
         }
         if (show_all || strcmp(param, "ch") == 0) {
-          Serial.println("  Channels:");
-          Serial.printf("    [0] Public%s%s\r\n", 
+          Console.println("  Channels:");
+          Console.printf("    [0] Public%s%s\r\n", 
             _prefs.selected_channel_idx == 0 ? " *" : "",
             channel_muted[0] ? " (muted)" : "");
           for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
             if (_prefs.channels[i].active) {
-              Serial.printf("    [%d] %s%s%s\r\n", 
+              Console.printf("    [%d] %s%s%s\r\n", 
                 i + 1, 
                 _prefs.channels[i].name,
                 _prefs.selected_channel_idx == (i + 1) ? " *" : "",
@@ -1044,7 +1171,7 @@ public:
     } else if (memcmp(command, "del ch ", 7) == 0) {  // del ch <name>
       const char* ch_name = &command[7];
       if (strcasecmp(ch_name, "public") == 0) {
-        Serial.println("   ERROR: Cannot delete Public channel");
+        Console.println("   ERROR: Cannot delete Public channel");
       } else if (removeUserChannel(ch_name)) {
         // Reset to Public if we deleted selected channel
         const char* selected_name = getChannelNameFromPrefs(_prefs.selected_channel_idx);
@@ -1052,12 +1179,12 @@ public:
           _prefs.selected_channel_idx = 0;
         }
         savePrefs();
-        Serial.printf("   Channel '%s' removed - reboot to apply\n", ch_name);
+        Console.printf("   Channel '%s' removed - reboot to apply\n", ch_name);
       } else {
-        Serial.println("   ERROR: Channel not found");
+        Console.println("   ERROR: Channel not found");
       }
     } else if (memcmp(command, "ver", 3) == 0) {
-      Serial.println(FIRMWARE_VER_TEXT);
+      Console.println(FIRMWARE_VER_TEXT);
     } else if (memcmp(command, "mute ch ", 8) == 0) {  // mute ch <name>
       const char* ch_name = &command[8];
       int idx = findChannelByName(ch_name);
@@ -1067,9 +1194,9 @@ public:
           _prefs.channels[idx - 1].muted = true;
         }
         savePrefs();
-        Serial.printf("   Channel '%s' muted\n", getChannelName(idx));
+        Console.printf("   Channel '%s' muted\n", getChannelName(idx));
       } else {
-        Serial.println("   ERROR: Channel not found");
+        Console.println("   ERROR: Channel not found");
       }
     } else if (memcmp(command, "unmute ch ", 10) == 0) {  // unmute ch <name>
       const char* ch_name = &command[10];
@@ -1080,9 +1207,9 @@ public:
           _prefs.channels[idx - 1].muted = false;
         }
         savePrefs();
-        Serial.printf("   Channel '%s' unmuted\n", getChannelName(idx));
+        Console.printf("   Channel '%s' unmuted\n", getChannelName(idx));
       } else {
-        Serial.println("   ERROR: Channel not found");
+        Console.println("   ERROR: Channel not found");
       }
     } else if (memcmp(command, "mute", 4) == 0) {
       if (command[4] == 0 || command[4] == ' ') {  // "mute" or "mute <type>"
@@ -1090,9 +1217,9 @@ public:
         if (strcmp(type, "advert") == 0) {
           _prefs.mute_adverts = true;
           savePrefs();
-          Serial.println("   ADVERT messages muted");
+          Console.println("   ADVERT messages muted");
         } else {
-          Serial.println("   ERROR: unknown mute type (try: advert, or 'ch <name>')");
+          Console.println("   ERROR: unknown mute type (try: advert, or 'ch <name>')");
         }
       }
     } else if (memcmp(command, "unmute", 6) == 0) {
@@ -1101,47 +1228,97 @@ public:
         if (strcmp(type, "advert") == 0) {
           _prefs.mute_adverts = false;
           savePrefs();
-          Serial.println("   ADVERT messages unmuted");
+          Console.println("   ADVERT messages unmuted");
         } else {
-          Serial.println("   ERROR: unknown unmute type (try: advert, or 'ch <name>')");
+          Console.println("   ERROR: unknown unmute type (try: advert, or 'ch <name>')");
         }
       }
     } else if (memcmp(command, "reboot", 6) == 0) {
-      Serial.println("Rebooting...");
-      Serial.flush();  // ensure message is sent before reboot
+      Console.println("Rebooting...");
+      Console.flush();  // ensure message is sent before reboot
       delay(100);
       board.reboot();
+    } else if (memcmp(command, "serial ", 7) == 0) {
+      const char* subcmd = &command[7];
+      if (memcmp(subcmd, "list", 4) == 0) {
+        Console.println("Available serial ports:");
+        for (int i = 0; i < 3; i++) {
+          Console.print("   ");
+          Console.print(i);
+          Console.print(": ");
+          Console.print(Console.getPortName(i));
+          Console.print(" - ");
+          Console.println(Console.isEnabled(i) ? "ENABLED" : "disabled");
+        }
+        Console.println("Note: Port 0 (USB) cannot be disabled");
+      } else if (memcmp(subcmd, "enable ", 7) == 0) {
+        int port = _atoi(&subcmd[7]);
+        if (port >= 0 && port < 3) {
+          Console.enablePort(port);
+          _prefs.serial_enabled[port] = true;
+          savePrefs();
+          Console.print("Enabled ");
+          Console.println(Console.getPortName(port));
+        } else {
+          Console.println("   ERROR: Invalid port number (0-2)");
+        }
+      } else if (memcmp(subcmd, "disable ", 8) == 0) {
+        int port = _atoi(&subcmd[8]);
+        if (port == 0) {
+          Console.println("   ERROR: Cannot disable USB serial (port 0)");
+        } else if (port >= 1 && port < 3) {
+          Console.disablePort(port);
+          _prefs.serial_enabled[port] = false;
+          savePrefs();
+          Console.print("Disabled ");
+          Console.println(Console.getPortName(port));
+        } else {
+          Console.println("   ERROR: Invalid port number (1-2)");
+        }
+      } else {
+        Console.println("   Usage: serial list|enable <N>|disable <N>");
+      }
     } else if (memcmp(command, "help", 4) == 0) {
-      Serial.println("Commands:");
-      Serial.println("   set {name|lat|lon|freq|tx|sf|cr|bw|af} {value}");
-      Serial.println("   set ch <name> <hex_key>  - add channel (32 or 64 hex chars)");
-      Serial.println("   set ch #<name>           - add hashtag channel");
-      Serial.println("   get [{name|lat|lon|freq|tx|sf|cr|bw|af|ch}]");
-      Serial.println("   del ch <name>            - delete channel");
-      Serial.println("   card");
-      Serial.println("   import {biz card}");
-      Serial.println("   clock");
-      Serial.println("   time <epoch-seconds>");
-      Serial.println("   list {n}");
-      Serial.println("   to <recipient name or prefix>");
-      Serial.println("      (use TAB to autocomplete contact names)");
-      Serial.println("   to");
-      Serial.println("   send <text>");
-      Serial.println("   chsel <name>             - select channel");
-      Serial.println("   ch <text>                - send to selected channel");
-      Serial.println("   mute ch <name>           - mute channel");
-      Serial.println("   unmute ch <name>         - unmute channel");
-      Serial.println("   mute [advert]");
-      Serial.println("   unmute [advert]");
-      Serial.println("   advert");
-      Serial.println("   reset path");
-      Serial.println("   reboot");
-      Serial.println();
-      Serial.println("Keyboard shortcuts:");
-      Serial.println("   TAB - autocomplete contact name after 'to '");
-      Serial.println("   ESC - clear current input line");
+      Console.println("Commands (page 1/2):");
+      Console.println("   set {name|lat|lon|freq|tx|sf|cr|bw|af} {value}");
+      Console.println("   set ch <name> <hex_key>  - add channel (32/64 hex chars)");
+      Console.println("   set ch #<name>           - add hashtag channel");
+      Console.println("   get [{name|lat|lon|freq|tx|sf|cr|bw|af|ch}]");
+      Console.println("   del ch <name>            - delete channel");
+      Console.println("   card                     - show your biz card");
+      Console.println("   import {biz card}        - import contact from biz card");
+      Console.println("   clock                    - show current time");
+      Console.println("   time <epoch-seconds>     - set current time");
+      Console.println("   list {n}                 - list recent contacts");
+      Console.print("-- Press SPACE for more, any other key to continue -- ");
+      
+      // Wait for user input
+      while (!Console.available()) {
+        delay(10);
+      }
+      char c = Console.read();
+      Console.println();
+      
+      if (c == ' ') {  // Show page 2
+        Console.println("Commands (page 2/2):");
+        Console.println("   to <recipient name>      - select recipient by name");
+        Console.println("   send <text>              - send to selected recipient");
+        Console.println("   chsel <name>             - select channel");
+        Console.println("   ch <text>                - send to selected channel");
+        Console.println("   mute|unmute ch <name>    - mute/unmute channel");
+        Console.println("   mute|unmute [advert]     - mute/unmute adverts");
+        Console.println("   serial list              - list serial ports");
+        Console.println("   serial enable|disable <N> - enable/disable serial port");
+        Console.println("   advert                   - send advert");
+        Console.println("   reset path               - reset route path");
+        Console.println("   reboot                   - reboot device");
+        Console.println();
+        Console.println("Keyboard shortcuts:");
+        Console.println("   TAB - autocomplete contact or channel names");
+        Console.println("   ESC - clear current input line");
+      }
     } else {
-      Serial.print("   ERROR: unknown command: "); Serial.println(command);
+      Console.print("   ERROR: unknown command: "); Console.println(command);
     }
   }
 
@@ -1149,14 +1326,14 @@ public:
     BaseChatMesh::loop();
 
     int len = strlen(command);
-    while (Serial.available() && len < sizeof(command)-1) {
-      char c = Serial.read();
+    while (Console.available() && len < sizeof(command)-1) {
+      char c = Console.read();
       if (c == '\r' || c == '\n') {
         if (len > 0) {  // have command to process
           command[len] = 0;  // null terminate
-          Serial.println();  // echo newline
+          Console.println();  // echo newline
           handleCommand(command);
-          Serial.print("\r> ");  // prompt for next command
+          Console.print("\r> ");  // prompt for next command
           command[0] = 0;  // reset
           len = 0;
         }
@@ -1165,30 +1342,30 @@ public:
         handleTabCompletion(len);
       } else if (c == 27) {  // Escape key - clear current command
         // Clear the current line by overwriting with spaces
-        Serial.print('\r');
+        Console.print('\r');
         for (int i = 0; i < len + 2; i++) {  // +2 for "> "
-          Serial.print(' ');
+          Console.print(' ');
         }
         // Reset command buffer
         command[0] = 0;
         len = 0;
         // Show fresh prompt
-        Serial.print("\r> ");
+        Console.print("\r> ");
       } else if (c == 8 || c == 127) {  // backspace or delete
         if (len > 0) {
           len--;
           command[len] = 0;
-          Serial.print("\b \b");  // backspace, space, backspace - erases character on terminal
+          Console.print("\b \b");  // backspace, space, backspace - erases character on terminal
         }
       } else {
         command[len++] = c;
         command[len] = 0;
-        Serial.print(c);  // echo character as typed
+        Console.print(c);  // echo character as typed
       }
     }
     if (len >= sizeof(command)-1) {  // command buffer full
-      Serial.println();
-      Serial.println("   ERROR: command too long");
+      Console.println();
+      Console.println("   ERROR: command too long");
       command[0] = 0;
     }
   }
@@ -1203,7 +1380,9 @@ void halt() {
 }
 
 void setup() {
+  // Initialize USB Serial (always enabled)
   Serial.begin(SERIAL_BAUD);
+  // Note: Serial1 and Serial2 will be initialized when enabled via 'serial enable' command
   delay(100);  // Give serial time to initialize
 
   board.begin();
