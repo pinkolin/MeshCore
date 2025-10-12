@@ -165,11 +165,17 @@ public:
   size_t write(uint8_t c) override {
     for (int i = 0; i < 3; i++) {
       if (ports[i].enabled) {
-        // For USB (port 0), always write immediately
-        // For hardware serial (ports 1-2), only write if buffer has space to avoid blocking
-        if (i == 0 || ports[i].serial->availableForWrite() > 0) {
-          ports[i].serial->write(c);
+        // For hardware serial (ports 1-2), check buffer and wait briefly if needed
+        if (i > 0) {
+          // If buffer is getting full (less than 16 bytes free), wait a bit
+          int retries = 0;
+          while (ports[i].serial->availableForWrite() < 16 && retries < 10) {
+            delayMicroseconds(100);  // Wait 100us, then check again
+            retries++;
+          }
         }
+        // Write to the port (USB always, hardware serial after buffer check)
+        ports[i].serial->write(c);
       }
     }
     return 1;
