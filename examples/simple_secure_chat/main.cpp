@@ -2498,4 +2498,5 @@ void setup() {
 
 void loop() {
   the_mesh.loop();
+  rtc_clock.tick();
 }
