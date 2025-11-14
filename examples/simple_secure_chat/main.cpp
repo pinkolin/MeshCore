@@ -197,14 +197,27 @@ public:
         telnetClient.setNoDelay(true);
         
         // Telnet protocol negotiation
-        // Tell client: server WILL do echo, client should NOT echo
+        // Tell client: server WILL do echo, client should NOT echo, and use BINARY mode for UTF-8
         uint8_t telnetOpts[] = {
           255, 251, 1,   // IAC WILL ECHO (server does echo)
           255, 254, 1,   // IAC DONT ECHO (client should not echo)
           255, 251, 3,   // IAC WILL SUPPRESS-GO-AHEAD
-          255, 252, 34   // IAC WONT LINEMODE
+          255, 252, 34,  // IAC WONT LINEMODE
+          255, 251, 0,   // IAC WILL BINARY (server sends 8-bit data)
+          255, 253, 0    // IAC DO BINARY (client should send 8-bit data)
         };
         telnetClient.write(telnetOpts, sizeof(telnetOpts));
+        
+        // Request UTF-8 charset via subnegotiation
+        // IAC SB CHARSET REQUEST ";" "UTF-8" IAC SE
+        uint8_t charsetReq[] = {
+          255, 250, 42,  // IAC SB CHARSET
+          1,             // REQUEST
+          ';',           // separator
+          'U', 'T', 'F', '-', '8',  // UTF-8
+          255, 240       // IAC SE
+        };
+        telnetClient.write(charsetReq, sizeof(charsetReq));
         
         // Brief delay to let client respond to IAC commands
         delay(100);
@@ -289,9 +302,27 @@ public:
         
         // Filter telnet protocol sequences (IAC commands start with 255)
         if (c == 255) {
-          // IAC command - read and discard next 2 bytes
-          if (telnetClient.available()) telnetClient.read();
-          if (telnetClient.available()) telnetClient.read();
+          // IAC command - peek next byte to determine command type
+          if (telnetClient.available()) {
+            int cmd = telnetClient.read();
+            // IAC IAC = escaped 255 (literal 0xFF byte in data stream)
+            if (cmd == 255) {
+              triggerRxIndicator();
+              return 255;  // Return literal 0xFF
+            }
+            // WILL, WONT, DO, DONT (251-254) - read option byte
+            if (cmd >= 251 && cmd <= 254) {
+              if (telnetClient.available()) telnetClient.read();  // discard option
+            }
+            // SB (250) - subnegotiation, read until SE (240)
+            else if (cmd == 250) {
+              while (telnetClient.available()) {
+                int sb = telnetClient.read();
+                if (sb == 240) break;  // SE - end of subnegotiation
+              }
+            }
+            // Other IAC commands - just discard
+          }
           // Continue loop to get next character
           continue;
         }
@@ -448,6 +479,7 @@ struct NodePrefs {  // persisted to file
   bool wifi_enabled;       // WiFi client enabled
   bool bell_on_message;    // ring bell on new messages
   int8_t timezone_offset;  // timezone offset in hours from UTC (-12 to +14)
+  bool utf8_enabled;       // allow UTF-8 characters in terminal output
 };
 
 // Command definitions for help and autocomplete
@@ -477,7 +509,7 @@ static const CommandDef COMMANDS[] = {
   {"time", "<epoch>", "Set time (Unix timestamp in seconds)"},
   {"ver", "", "Show firmware version"},
   {"get", "[param]", "Show all config or specific parameter"},
-  {"set", "<param> <value>", "Set config (af, name, lat, lon, tx, freq, sf, cr, bw, tz)"},
+  {"set", "<param> <value>", "Set config (af, name, lat, lon, tx, freq, sf, cr, bw, tz, utf8)"},
   {"serial", "enable|disable <0-2>", "Enable/disable serial port"},
   {"wifi", "[ssid] [password]|disable", "Configure WiFi"},
   {"reboot", "", "Reboot the device"},
@@ -1435,11 +1467,15 @@ protected:
   }
 
   void onMessageRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t sender_timestamp, const char *text) override {
-    // Create a mutable copy of the text to remove diacritics
+    // Create a mutable copy of the text
     char text_copy[256];
     strncpy(text_copy, text, sizeof(text_copy) - 1);
     text_copy[sizeof(text_copy) - 1] = 0;
-    removeDiacritics(text_copy);
+    
+    // Remove diacritics only if UTF-8 is disabled
+    if (!_prefs.utf8_enabled) {
+      removeDiacritics(text_copy);
+    }
     
     if (_prefs.bell_on_message) {
       Console.print("\a");  // Bell - alert user of new message
@@ -1494,11 +1530,15 @@ protected:
     // Save to history (with original text, before diacritic removal)
     addChannelMessage(channel_name, sender_name, text, timestamp);
     
-    // Create a mutable copy of the text to remove diacritics
+    // Create a mutable copy of the text
     char text_copy[256];
     strncpy(text_copy, text, sizeof(text_copy) - 1);
     text_copy[sizeof(text_copy) - 1] = 0;
-    removeDiacritics(text_copy);
+    
+    // Remove diacritics only if UTF-8 is disabled
+    if (!_prefs.utf8_enabled) {
+      removeDiacritics(text_copy);
+    }
     
     if (_prefs.bell_on_message) {
       Console.print("\a");  // Bell - alert user of new channel message
@@ -1562,6 +1602,7 @@ public:
     _prefs.wifi_enabled = false;  // WiFi disabled by default
     _prefs.bell_on_message = false;  // bell disabled by default
     _prefs.timezone_offset = 0;   // UTC by default
+    _prefs.utf8_enabled = false;  // ASCII only by default (remove diacritics)
     
     // Initialize channels array
     for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
@@ -2064,6 +2105,19 @@ public:
         } else {
           Console.println("  ERROR: timezone must be between -12 and +14");
         }
+      } else if (memcmp(config, "utf8 ", 5) == 0) {
+        const char* value = &config[5];
+        if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0) {
+          _prefs.utf8_enabled = true;
+          savePrefs();
+          Console.println("  OK - UTF-8 characters enabled");
+        } else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) {
+          _prefs.utf8_enabled = false;
+          savePrefs();
+          Console.println("  OK - UTF-8 disabled (ASCII only)");
+        } else {
+          Console.println("  ERROR: use 'on' or 'off'");
+        }
       } else {
         Console.printf("  ERROR: unknown config: %s\n", config);
       }
@@ -2103,6 +2157,10 @@ public:
           Console.print("  tz:   UTC"); 
           if (_prefs.timezone_offset >= 0) Console.print("+");
           Console.println(_prefs.timezone_offset);
+        }
+        if (show_all || strcmp(param, "utf8") == 0) {
+          Console.print("  utf8: ");
+          Console.println(_prefs.utf8_enabled ? "on" : "off");
         }
         if (show_all || strcmp(param, "ch") == 0) {
           Console.println("  Channels:");
@@ -2431,9 +2489,25 @@ public:
           Console.print("\b \b");  // backspace, space, backspace - erases character on terminal
         }
       } else {
+        // Store character in buffer
         command[len++] = c;
         command[len] = 0;
-        Console.print(c);  // echo character as typed
+        
+        // Echo the character
+        // For UTF-8 multibyte sequences, we need to echo the whole sequence
+        // Check if this is a UTF-8 continuation byte (10xxxxxx)
+        bool is_continuation = (c & 0xC0) == 0x80;
+        
+        if (!is_continuation) {
+          // This is either ASCII or UTF-8 start byte - always echo
+          Console.print(c);
+        } else {
+          // This is a UTF-8 continuation byte
+          // Echo it only if we're in a multibyte sequence (previous char was non-ASCII)
+          if (len >= 2 && (unsigned char)command[len-2] >= 0x80) {
+            Console.print(c);
+          }
+        }
       }
     }
     if (len >= sizeof(command)-1) {  // command buffer full
