@@ -22,9 +22,18 @@
 unsigned int encode_base64(const unsigned char input[], unsigned int input_length, unsigned char output[]);
 unsigned int decode_base64(const unsigned char input[], unsigned int input_length, unsigned char output[]);
 
+/* ---------------------------------- RX/TX INDICATORS ----------------------------------- */
+
+// Don't use XBM icons - just draw filled rectangles and text labels
+// This is simpler and more visible on small OLED displays
+
+#define RX_TX_BOX_WIDTH   20
+#define RX_TX_BOX_HEIGHT  20
+#define RX_TX_BLINK_MS    300  // How long to show the indicator
+
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "v4 (build: 14 Nov 2025)"
+#define FIRMWARE_VER_TEXT   "v4 (14 Nov 2025)"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   915.0
@@ -95,6 +104,10 @@ static uint32_t _atoi(const char* sp) {
     #define TELNET_PORT 23
   #endif
 #endif
+
+// Forward declarations for RX/TX indicators
+void triggerRxIndicator();
+void triggerTxIndicator();
 
 // Dynamic MultiSerial Wrapper - broadcasts output to enabled serial ports and telnet
 class MultiSerial : public Stream {
@@ -283,6 +296,7 @@ public:
           continue;
         }
         // Got a normal character from telnet
+        triggerRxIndicator();  // Trigger RX indicator
         return c;
       }
     }
@@ -290,6 +304,7 @@ public:
     // Then check serial ports
     for (int i = 0; i < 3; i++) {
       if (ports[i].enabled && ports[i].serial->available()) {
+        triggerRxIndicator();  // Trigger RX indicator
         return ports[i].serial->read();
       }
     }
@@ -313,6 +328,8 @@ public:
   }
   
   size_t write(uint8_t c) override {
+    triggerTxIndicator();  // Trigger TX indicator
+    
     // Write to serial ports
     for (int i = 0; i < 3; i++) {
       if (ports[i].enabled) {
@@ -2431,6 +2448,95 @@ StdRNG fast_rng;
 SimpleMeshTables tables;
 MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables);
 
+// RX/TX indicator state
+uint32_t rx_blink_until = 0;
+uint32_t tx_blink_until = 0;
+bool last_rx_state = false;
+bool last_tx_state = false;
+
+#ifdef DISPLAY_CLASS
+void updateRxTxIndicators() {
+  if (!display.isOn()) return;
+  
+  int w = display.width();
+  int h = display.height();
+  
+  // Only show indicators if display is large enough (at least 60x20)
+  if (w < 60 || h < 20) return;
+  
+  uint32_t now = millis();
+  bool rx_on = (now < rx_blink_until);
+  bool tx_on = (now < tx_blink_until);
+  
+  // Only update if state changed
+  if (rx_on == last_rx_state && tx_on == last_tx_state) {
+    return;
+  }
+  
+  last_rx_state = rx_on;
+  last_tx_state = tx_on;
+  
+  // Center indicators on screen
+  // Layout: TX [box]    RX [box]
+  int text_width = 24;  // "TX" or "RX" at size 2 (each char is 6*2=12px wide)
+  int spacing = 4;      // Gap between text and box
+  int gap = 20;         // Gap between TX and RX groups
+  int total_width = (text_width + spacing + RX_TX_BOX_WIDTH) * 2 + gap;
+  int start_x = (w - total_width) / 2;
+  int y = (h - RX_TX_BOX_HEIGHT) / 2;  // Vertically centered
+  
+  int tx_text_x = start_x;
+  int tx_box_x = tx_text_x + text_width + spacing;
+  int rx_text_x = tx_box_x + RX_TX_BOX_WIDTH + gap;
+  int rx_box_x = rx_text_x + text_width + spacing;
+  
+  // Start frame for partial update
+  display.startFrame();
+  display.setTextSize(2);
+  
+  // Draw TX indicator
+  if (tx_on) {
+    display.setColor(DisplayDriver::LIGHT);
+    display.fillRect(tx_box_x, y, RX_TX_BOX_WIDTH, RX_TX_BOX_HEIGHT);
+    display.setCursor(tx_text_x, y + 2);
+    display.print("TX");
+  } else {
+    // Clear TX area
+    display.setColor(DisplayDriver::DARK);
+    display.fillRect(tx_box_x, y, RX_TX_BOX_WIDTH, RX_TX_BOX_HEIGHT);
+    display.fillRect(tx_text_x, y, 24, 20);  // Clear text (size 2)
+  }
+  
+  // Draw RX indicator
+  if (rx_on) {
+    display.setColor(DisplayDriver::LIGHT);
+    display.fillRect(rx_box_x, y, RX_TX_BOX_WIDTH, RX_TX_BOX_HEIGHT);
+    display.setCursor(rx_text_x, y + 2);
+    display.print("RX");
+  } else {
+    // Clear RX area
+    display.setColor(DisplayDriver::DARK);
+    display.fillRect(rx_box_x, y, RX_TX_BOX_WIDTH, RX_TX_BOX_HEIGHT);
+    display.fillRect(rx_text_x, y, 24, 20);  // Clear text (size 2)
+  }
+  
+  // End frame to push to display
+  display.endFrame();
+}
+
+void triggerRxIndicator() {
+  rx_blink_until = millis() + RX_TX_BLINK_MS;
+}
+
+void triggerTxIndicator() {
+  tx_blink_until = millis() + RX_TX_BLINK_MS;
+}
+#else
+void updateRxTxIndicators() {}
+void triggerRxIndicator() {}
+void triggerTxIndicator() {}
+#endif
+
 void halt() {
   while (1) ;
 }
@@ -2458,6 +2564,30 @@ void setup() {
   // Note: Serial1 and Serial2 will be initialized when enabled via 'serial enable' command
 
   board.begin();
+
+#ifdef DISPLAY_CLASS
+  // Initialize display for RX/TX indicators
+  Serial.println("Initializing display...");
+  if (display.begin()) {
+    Serial.println("Display initialized successfully");
+    display.turnOn();
+    display.clear();
+    display.startFrame();
+    display.setTextSize(2);
+    display.setColor(DisplayDriver::LIGHT);
+    display.setCursor(0, 15);
+    display.print("MESHCORE");
+    display.setCursor(0, 35);
+    display.print("TERM");
+    display.setTextSize(1);
+    display.setCursor(0, 55);
+    display.print(FIRMWARE_VER_TEXT);
+    display.endFrame();
+    Serial.println("Display content written");
+  } else {
+    Serial.println("Display initialization FAILED");
+  }
+#endif
 
   if (!radio_init()) { 
     halt(); 
@@ -2499,4 +2629,7 @@ void setup() {
 void loop() {
   the_mesh.loop();
   rtc_clock.tick();
+  
+  // Update RX/TX indicators on display (if present)
+  updateRxTxIndicators();
 }
