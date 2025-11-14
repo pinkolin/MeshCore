@@ -777,7 +777,8 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
         // No matches
         Console.print('\a');  // beep
       }
-      return;
+      return;  // Exit after handling command completion
+    }
     
     // Case 3: @mention completion in channel message (or plain text which is auto-ch)
     // Look for "@" somewhere in the text
@@ -809,9 +810,6 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
           
           // First, scan contacts
           scanRecentContacts(0, &autocomplete_visitor);
-          
-          // Debug: show what we're searching for
-          // Console.printf("\n[DEBUG] Searching for '@%s', found %d contacts\n", prefix, autocomplete_visitor.match_count);
           
           // Then, scan channel message history for additional names
           for (int i = 0; i < history_count && autocomplete_visitor.match_count < MAX_CONTACTS; i++) {
@@ -877,7 +875,6 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
           return;  // We handled it, don't continue
         }
       }
-    }
     
     // Case 4: "to " command completion
     if (len >= 3 && memcmp(command, "/to", 3) == 0) {
