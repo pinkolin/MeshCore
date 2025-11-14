@@ -7,6 +7,7 @@
   #include <LittleFS.h>
 #elif defined(ESP32)
   #include <SPIFFS.h>
+  #include <time.h>  // For NTP time functions
 #endif
 
 #include <helpers/ArduinoHelpers.h>
@@ -23,7 +24,7 @@ unsigned int decode_base64(const unsigned char input[], unsigned int input_lengt
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "v3 (build: 09 Oct 2025)"
+#define FIRMWARE_VER_TEXT   "v4 (build: 14 Nov 2025)"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   915.0
@@ -45,10 +46,22 @@ unsigned int decode_base64(const unsigned char input[], unsigned int input_lengt
   #define MAX_CONTACTS         100
 #endif
 
+#ifndef MAX_CHANNEL_HISTORY
+  #define MAX_CHANNEL_HISTORY  50  // Maximum number of channel messages to store
+#endif
+
+#ifndef MAX_DM_HISTORY
+  #define MAX_DM_HISTORY  50  // Maximum number of direct messages to store
+#endif
+
 #include <helpers/BaseChatMesh.h>
 
 // Note: MAX_GROUP_CHANNELS is defined in platformio.ini (e.g., 4)
 // We reserve 1 slot for built-in Public channel, leaving MAX_GROUP_CHANNELS-1 for user channels
+
+#ifndef MAX_GROUP_CHANNELS
+#define MAX_GROUP_CHANNELS 4
+#endif
 
 #define SEND_TIMEOUT_BASE_MILLIS          500
 #define FLOOD_SEND_TIMEOUT_FACTOR         16.0f
@@ -74,7 +87,16 @@ static uint32_t _atoi(const char* sp) {
 
 /* -------------------------------------------------------------------------------------- */
 
-// Dynamic MultiSerial Wrapper - broadcasts output to enabled serial ports
+#if defined(ESP32)
+  #include <WiFi.h>
+  #include <WiFiClient.h>
+  
+  #ifndef TELNET_PORT
+    #define TELNET_PORT 23
+  #endif
+#endif
+
+// Dynamic MultiSerial Wrapper - broadcasts output to enabled serial ports and telnet
 class MultiSerial : public Stream {
 private:
   struct SerialPort {
@@ -84,6 +106,13 @@ private:
   };
   
   SerialPort ports[3];  // Serial, Serial1, Serial2
+
+#if defined(ESP32)
+  WiFiServer* telnetServer;
+  WiFiClient telnetClient;
+  bool telnetEnabled;
+  bool telnetNewConnection;  // Flag for new telnet connection
+#endif
   
 public:
   MultiSerial() {
@@ -99,7 +128,94 @@ public:
     ports[2].serial = &Serial2;
     ports[2].enabled = false;
     ports[2].name = "Serial2";
+
+#if defined(ESP32)
+    telnetServer = nullptr;
+    telnetEnabled = false;
+    telnetNewConnection = false;
+#endif
   }
+
+#if defined(ESP32)
+  void enableTelnet() {
+    if (!telnetEnabled) {
+      telnetServer = new WiFiServer(TELNET_PORT);
+      telnetServer->begin();
+      telnetServer->setNoDelay(true);
+      telnetEnabled = true;
+    }
+  }
+  
+  void disableTelnet() {
+    if (telnetEnabled && telnetServer) {
+      if (telnetClient) {
+        telnetClient.stop();
+      }
+      telnetServer->stop();
+      delete telnetServer;
+      telnetServer = nullptr;
+      telnetEnabled = false;
+    }
+  }
+  
+  bool isTelnetEnabled() {
+    return telnetEnabled;
+  }
+  
+  bool isTelnetConnected() {
+    return telnetEnabled && telnetClient && telnetClient.connected();
+  }
+  
+  bool checkAndClearNewTelnetConnection() {
+    if (telnetNewConnection) {
+      telnetNewConnection = false;
+      return true;
+    }
+    return false;
+  }
+  
+  void handleTelnet() {
+    if (!telnetEnabled || !telnetServer) return;
+    
+    // Check for new client
+    if (!telnetClient || !telnetClient.connected()) {
+      telnetClient = telnetServer->available();
+      if (telnetClient && telnetClient.connected()) {
+        telnetClient.setNoDelay(true);
+        
+        // Telnet protocol negotiation
+        // Tell client: server WILL do echo, client should NOT echo
+        uint8_t telnetOpts[] = {
+          255, 251, 1,   // IAC WILL ECHO (server does echo)
+          255, 254, 1,   // IAC DONT ECHO (client should not echo)
+          255, 251, 3,   // IAC WILL SUPPRESS-GO-AHEAD
+          255, 252, 34   // IAC WONT LINEMODE
+        };
+        telnetClient.write(telnetOpts, sizeof(telnetOpts));
+        
+        // Brief delay to let client respond to IAC commands
+        delay(100);
+        
+        // Flush any IAC responses (but only IAC, not user input)
+        while (telnetClient.available()) {
+          int c = telnetClient.peek();
+          if (c == 255) {  // IAC sequence
+            telnetClient.read();  // Consume it
+            if (telnetClient.available()) telnetClient.read();
+            if (telnetClient.available()) telnetClient.read();
+          } else {
+            break;  // Stop if we hit actual user input
+          }
+        }
+        
+        // Send welcome message
+        telnetClient.println("\r\nMeshCore Telnet Terminal");
+        telnetClient.println("Type 'help' for commands\r\n");
+        telnetNewConnection = true;  // Signal that prompt should be shown
+      }
+    }
+  }
+#endif
   
   void enablePort(int idx) {
     if (idx >= 0 && idx < 3) {
@@ -136,6 +252,13 @@ public:
   
   // Stream interface
   int available() override {
+#if defined(ESP32)
+    // Check telnet first (higher priority for remote users)
+    if (telnetEnabled && telnetClient && telnetClient.connected() && telnetClient.available()) {
+      return telnetClient.available();
+    }
+#endif
+    // Then check serial ports
     for (int i = 0; i < 3; i++) {
       if (ports[i].enabled && ports[i].serial->available()) {
         return ports[i].serial->available();
@@ -145,6 +268,26 @@ public:
   }
   
   int read() override {
+#if defined(ESP32)
+    // Check telnet first
+    if (telnetEnabled && telnetClient && telnetClient.connected()) {
+      while (telnetClient.available()) {
+        int c = telnetClient.read();
+        
+        // Filter telnet protocol sequences (IAC commands start with 255)
+        if (c == 255) {
+          // IAC command - read and discard next 2 bytes
+          if (telnetClient.available()) telnetClient.read();
+          if (telnetClient.available()) telnetClient.read();
+          // Continue loop to get next character
+          continue;
+        }
+        // Got a normal character from telnet
+        return c;
+      }
+    }
+#endif
+    // Then check serial ports
     for (int i = 0; i < 3; i++) {
       if (ports[i].enabled && ports[i].serial->available()) {
         return ports[i].serial->read();
@@ -154,6 +297,13 @@ public:
   }
   
   int peek() override {
+#if defined(ESP32)
+    // Check telnet first
+    if (telnetEnabled && telnetClient && telnetClient.connected() && telnetClient.available()) {
+      return telnetClient.peek();
+    }
+#endif
+    // Then check serial ports
     for (int i = 0; i < 3; i++) {
       if (ports[i].enabled && ports[i].serial->available()) {
         return ports[i].serial->peek();
@@ -163,6 +313,7 @@ public:
   }
   
   size_t write(uint8_t c) override {
+    // Write to serial ports
     for (int i = 0; i < 3; i++) {
       if (ports[i].enabled) {
         // For hardware serial (ports 1-2), check buffer and wait briefly if needed
@@ -178,7 +329,49 @@ public:
         ports[i].serial->write(c);
       }
     }
+    
+#if defined(ESP32)
+    // Write to telnet if connected (server does echo for telnet)
+    if (telnetEnabled && telnetClient && telnetClient.connected()) {
+      telnetClient.write(c);
+    }
+#endif
+    
     return 1;
+  }
+  
+  size_t write(const uint8_t *buffer, size_t size) override {
+    // Write to serial ports
+    for (int i = 0; i < 3; i++) {
+      if (ports[i].enabled) {
+        // For hardware serial (ports 1-2), check buffer space
+        if (i > 0) {
+          size_t written = 0;
+          while (written < size) {
+            int available = ports[i].serial->availableForWrite();
+            if (available > 0) {
+              size_t toWrite = min((size_t)available, size - written);
+              ports[i].serial->write(buffer + written, toWrite);
+              written += toWrite;
+            } else {
+              delayMicroseconds(100);
+            }
+          }
+        } else {
+          // USB port - write all at once
+          ports[i].serial->write(buffer, size);
+        }
+      }
+    }
+    
+#if defined(ESP32)
+    // Write to telnet in one go - much faster! (server does echo for telnet)
+    if (telnetEnabled && telnetClient && telnetClient.connected()) {
+      telnetClient.write(buffer, size);
+    }
+#endif
+    
+    return size;
   }
   
   void flush() override {
@@ -187,12 +380,31 @@ public:
         ports[i].serial->flush();
       }
     }
+#if defined(ESP32)
+    if (telnetEnabled && telnetClient && telnetClient.connected()) {
+      telnetClient.flush();
+    }
+#endif
   }
 };
 
 MultiSerial Console;  // Global multi-serial wrapper
 
 /* -------------------------------------------------------------------------------------- */
+
+struct ChannelMessage {
+  uint32_t timestamp;
+  char channel_name[32];
+  char sender_name[32];
+  char text[128];
+};
+
+struct DirectMessage {
+  uint32_t timestamp;
+  char sender_name[32];
+  char text[128];
+  bool outgoing;  // true if sent by us, false if received
+};
 
 struct UserChannel {
   char name[32];          // channel name (or hashtag like #mychannel)
@@ -214,7 +426,47 @@ struct NodePrefs {  // persisted to file
   UserChannel channels[MAX_GROUP_CHANNELS - 1];  // user-defined channels
   int selected_channel_idx;  // currently selected channel for 'ch' command (-1 = none, 0 = public)
   bool serial_enabled[3];  // serial ports enabled state (0=USB, 1=Serial1, 2=Serial2)
+  char wifi_ssid[64];      // WiFi SSID for client mode
+  char wifi_password[64];  // WiFi password
+  bool wifi_enabled;       // WiFi client enabled
+  bool bell_on_message;    // ring bell on new messages
+  int8_t timezone_offset;  // timezone offset in hours from UTC (-12 to +14)
 };
+
+// Command definitions for help and autocomplete
+struct CommandDef {
+  const char* name;
+  const char* args;
+  const char* description;
+};
+
+static const CommandDef COMMANDS[] = {
+  {"ch", "<text>", "Send message to selected channel"},
+  {"send", "<contact> <text>", "Send direct message to contact"},
+  {"to", "<contact>", "Select contact for DM (then just type text)"},
+  {"chsel", "<channel>", "Select channel for messages"},
+  {"list", "[count]", "List recent contacts"},
+  {"advert", "", "Send advertisement to mesh"},
+  {"ping", "<contact>", "Ping contact (request advertisement)"},
+  {"reset", "", "Reset path to current DM contact"},
+  {"history", "[name]", "Show DM or channel history"},
+  {"card", "", "Show your contact card"},
+  {"import", "<card>", "Import contact from card"},
+  {"mute", "ch <channel>|advert|bell", "Mute channel/adverts/bell"},
+  {"unmute", "ch <channel>|advert|bell", "Unmute channel/adverts/bell"},
+  {"set", "ch <name> <key>", "Add new channel"},
+  {"del", "ch <channel>", "Delete channel"},
+  {"clock", "", "Show current time (local and UTC)"},
+  {"time", "<epoch>", "Set time (Unix timestamp in seconds)"},
+  {"ver", "", "Show firmware version"},
+  {"get", "[param]", "Show all config or specific parameter"},
+  {"set", "<param> <value>", "Set config (af, name, lat, lon, tx, freq, sf, cr, bw, tz)"},
+  {"serial", "enable|disable <0-2>", "Enable/disable serial port"},
+  {"wifi", "[ssid] [password]|disable", "Configure WiFi"},
+  {"reboot", "", "Reboot the device"},
+  {"help", "", "Show this help"}
+};
+static const int COMMANDS_COUNT = sizeof(COMMANDS) / sizeof(COMMANDS[0]);
 
 class MyMesh : public BaseChatMesh, ContactVisitor {
   FILESYSTEM* _fs;
@@ -224,9 +476,21 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   bool channel_muted[MAX_GROUP_CHANNELS];
   unsigned long last_msg_sent;
   ContactInfo* curr_recipient;
+  ContactInfo* last_dm_recipient;  // Remember last DM recipient for TAB rotation
   char command[512+10];
   uint8_t tmp_buf[256];
   char hex_buf[512];
+  bool prompt_shown;  // Flag to show prompt only after WiFi init
+  
+  // Channel message history
+  ChannelMessage history[MAX_CHANNEL_HISTORY];
+  int history_count;
+  int history_next_idx;
+  
+  // Direct message history
+  DirectMessage dm_history[MAX_DM_HISTORY];
+  int dm_history_count;
+  int dm_history_next_idx;
 
   // Helper class for collecting matching contacts
   class AutocompleteVisitor : public ContactVisitor {
@@ -271,17 +535,311 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   
   AutocompleteVisitor autocomplete_visitor;
 
+  // Apply timezone offset to UTC timestamp and return local DateTime
+  DateTime getLocalTime(uint32_t utc_timestamp) {
+    int32_t offset_seconds = _prefs.timezone_offset * 3600;
+    uint32_t local_timestamp = utc_timestamp + offset_seconds;
+    return DateTime(local_timestamp);
+  }
+
+  // Build prompt prefix (without the trailing '> ')
+  void getPromptPrefix(char* buf, int bufsize) {
+    buf[0] = 0;
+    // If DM recipient is set, show only TO: (takes priority over channel)
+    if (curr_recipient) {
+      snprintf(buf, bufsize, "TO:%s ", curr_recipient->name);
+    }
+    // Otherwise show selected channel
+    else if (_prefs.selected_channel_idx >= 0) {
+      const char* ch = getChannelName(_prefs.selected_channel_idx);
+      if (ch && ch[0]) {
+        snprintf(buf, bufsize, "CH:%s ", ch);
+      }
+    }
+  }
+
+  // Clear the current prompt line by overwriting it with spaces and returning carriage
+  // If old_prefix is provided, use it to calculate the length to clear (for channel switching)
+  void clearPromptLine(const char* old_prefix = nullptr) {
+    // Compute length of prompt + command
+    char prefix[128];
+    if (old_prefix) {
+      strncpy(prefix, old_prefix, sizeof(prefix));
+      prefix[sizeof(prefix)-1] = 0;
+    } else {
+      getPromptPrefix(prefix, sizeof(prefix));
+    }
+    int plen = strlen(prefix) + 2; // add space for "> "
+    int cmdlen = strlen(command);
+    int total = plen + cmdlen;
+    // Carriage return
+    Console.print("\r");
+    // Overwrite with spaces
+    for (int i = 0; i < total; i++) Console.print(" ");
+    // Carriage return again
+    Console.print("\r");
+  }
+
   // Helper function to redraw the prompt with current command buffer
   void redrawPrompt() {
-    Console.print("\r> ");
+    char prefix[128];
+    getPromptPrefix(prefix, sizeof(prefix));
+    if (strlen(prefix) > 0) {
+      Console.print("\r");
+      Console.print(prefix);
+      Console.print("> ");
+    } else {
+      Console.print("\r> ");
+    }
     Console.print(command);  // print current command buffer
   }
 
   // Handle tab completion for "to" command
   void handleTabCompletion(int& len) {
-    // Check if we're in a "to " command
-    if (len >= 3 && memcmp(command, "to ", 3) == 0) {
-      const char* prefix = &command[3];
+    // Case 1: Empty prompt - rotate between channels and last TO: recipient
+    if (len == 0) {
+      // Save old prefix before changing
+      char old_prefix[128];
+      getPromptPrefix(old_prefix, sizeof(old_prefix));
+      
+      // If we're in TO: mode, switch back to first channel
+      if (curr_recipient) {
+        last_dm_recipient = curr_recipient;  // Remember for next TAB
+        curr_recipient = nullptr;  // Clear TO:
+        
+        // Find first active channel
+        for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+          if (i == 0 || active_channels[i] != nullptr) {
+            _prefs.selected_channel_idx = i;
+            savePrefs();
+            break;
+          }
+        }
+        
+        clearPromptLine(old_prefix);
+        redrawPrompt();
+        return;
+      }
+      
+      // Build list of active channel indices
+      int active_channels_list[MAX_GROUP_CHANNELS];
+      int active_count = 0;
+      for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+        if (i == 0 || active_channels[i] != nullptr) {
+          active_channels_list[active_count++] = i;
+        }
+      }
+      
+      // Find current position in the list
+      int current_pos = -1;
+      for (int i = 0; i < active_count; i++) {
+        if (active_channels_list[i] == _prefs.selected_channel_idx) {
+          current_pos = i;
+          break;
+        }
+      }
+      
+      // Determine next position
+      if (current_pos >= 0 && current_pos < active_count - 1) {
+        // Not at the end - switch to next channel
+        _prefs.selected_channel_idx = active_channels_list[current_pos + 1];
+        savePrefs();
+        clearPromptLine(old_prefix);
+        redrawPrompt();
+      } else if (last_dm_recipient != nullptr) {
+        // At the end and have a DM recipient - switch to TO:
+        curr_recipient = last_dm_recipient;
+        clearPromptLine(old_prefix);
+        redrawPrompt();
+      } else {
+        // At the end but no DM recipient - wrap to first channel
+        _prefs.selected_channel_idx = active_channels_list[0];
+        savePrefs();
+        clearPromptLine(old_prefix);
+        redrawPrompt();
+      }
+      
+      return;
+    }
+    
+    // Case 2: Command completion (starts with / and no space yet - just the command name)
+    if (command[0] == '/' && strchr(command, ' ') == nullptr) {
+      const char* prefix = &command[1];  // Skip the /
+      int prefix_len = len - 1;
+      
+      // Find matching commands
+      char matching_cmds[COMMANDS_COUNT][32];
+      int match_count = 0;
+      
+      for (int i = 0; i < COMMANDS_COUNT; i++) {
+        int cmd_len = strlen(COMMANDS[i].name);
+        
+        // Match only if:
+        // 1. Command is at least as long as prefix
+        // 2. First prefix_len characters match
+        if (cmd_len >= prefix_len) {
+          bool match = true;
+          for (int j = 0; j < prefix_len; j++) {
+            char c1 = COMMANDS[i].name[j];
+            char c2 = prefix[j];
+            if (c1 >= 'A' && c1 <= 'Z') c1 += 32;  // lowercase
+            if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+            if (c1 != c2) {
+              match = false;
+              break;
+            }
+          }
+          
+          if (match) {
+            strcpy(matching_cmds[match_count++], COMMANDS[i].name);
+          }
+        }
+      }
+      
+      if (match_count == 1) {
+        // Single match - autocomplete it
+        snprintf(&command[1], sizeof(command) - 1, "%s ", matching_cmds[0]);
+        len = 1 + strlen(matching_cmds[0]) + 1;  // / + command + space
+        command[len] = 0;
+        redrawPrompt();
+      } else if (match_count > 1) {
+        // Multiple matches - show them with descriptions
+        Console.println();
+        for (int i = 0; i < match_count; i++) {
+          // Find the command definition to show description
+          for (int j = 0; j < COMMANDS_COUNT; j++) {
+            if (strcmp(matching_cmds[i], COMMANDS[j].name) == 0) {
+              Console.print("   /");
+              Console.print(COMMANDS[j].name);
+              if (COMMANDS[j].args[0] != 0) {
+                Console.print(" ");
+                Console.print(COMMANDS[j].args);
+              }
+              int cmd_len = strlen(COMMANDS[j].name) + strlen(COMMANDS[j].args) + 1;
+              for (int k = cmd_len; k < 25; k++) Console.print(" ");
+              Console.print("- ");
+              Console.println(COMMANDS[j].description);
+              break;
+            }
+          }
+        }
+        redrawPrompt();
+      } else {
+        // No matches
+        Console.print('\a');  // beep
+      }
+      return;
+    
+    // Case 3: @mention completion in channel message (or plain text which is auto-ch)
+    // Look for "@" somewhere in the text
+    int at_pos = -1;
+    for (int i = 0; i < len; i++) {
+      if (command[i] == '@') {
+        at_pos = i;
+      }
+    }
+    
+    if (at_pos >= 0) {
+        // Found @, now check if cursor is right after it or in the middle of a name
+        // Extract prefix after @
+        const char* prefix = &command[at_pos + 1];
+        int prefix_len = len - at_pos - 1;
+        
+        // Check if we're still in the @ mention (no space after @)
+        bool in_mention = true;
+        for (int i = 0; i < prefix_len; i++) {
+          if (prefix[i] == ' ') {
+            in_mention = false;
+            break;
+          }
+        }
+        
+        if (in_mention) {
+          // Collect unique nicknames from channel history
+          autocomplete_visitor.reset(prefix);
+          
+          // First, scan contacts
+          scanRecentContacts(0, &autocomplete_visitor);
+          
+          // Debug: show what we're searching for
+          // Console.printf("\n[DEBUG] Searching for '@%s', found %d contacts\n", prefix, autocomplete_visitor.match_count);
+          
+          // Then, scan channel message history for additional names
+          for (int i = 0; i < history_count && autocomplete_visitor.match_count < MAX_CONTACTS; i++) {
+            if (history[i].sender_name[0] == 0) continue;
+            
+            // Check if this name matches the prefix
+            bool match = true;
+            int search_len = strlen(prefix);
+            for (int j = 0; j < search_len && history[i].sender_name[j] != 0; j++) {
+              char c1 = history[i].sender_name[j];
+              char c2 = prefix[j];
+              // Convert to lowercase for comparison
+              if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+              if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+              if (c1 != c2) {
+                match = false;
+                break;
+              }
+            }
+            
+            if (match) {
+              // Check if we already have this name
+              bool already_have = false;
+              for (int j = 0; j < autocomplete_visitor.match_count; j++) {
+                if (strcmp(autocomplete_visitor.matching_names[j], history[i].sender_name) == 0) {
+                  already_have = true;
+                  break;
+                }
+              }
+              
+              if (!already_have) {
+                strncpy(autocomplete_visitor.matching_names[autocomplete_visitor.match_count], 
+                       history[i].sender_name, 32);
+                autocomplete_visitor.matching_names[autocomplete_visitor.match_count][31] = 0;
+                autocomplete_visitor.match_count++;
+              }
+            }
+          }
+          
+          if (autocomplete_visitor.match_count == 1) {
+            // Single match - autocomplete it with [brackets]
+            snprintf(&command[at_pos], sizeof(command) - at_pos, "@[%s] ", autocomplete_visitor.matching_names[0]);
+            len = at_pos + strlen(&command[at_pos]);
+            command[len] = 0;
+            
+            // Redraw from beginning with channel/recipient prefix
+            redrawPrompt();
+          } else if (autocomplete_visitor.match_count > 1) {
+            // Multiple matches - show them
+            Console.println();
+            Console.println("Matches:");
+            for (int i = 0; i < autocomplete_visitor.match_count; i++) {
+              Console.print("   ");
+              Console.println(autocomplete_visitor.matching_names[i]);
+            }
+            
+            // Redraw prompt with current buffer
+            redrawPrompt();
+          } else {
+            // No matches
+            Console.print('\a');  // bell character
+          }
+          return;  // We handled it, don't continue
+        }
+      }
+    }
+    
+    // Case 4: "to " command completion
+    if (len >= 3 && memcmp(command, "/to", 3) == 0) {
+      // Add space if just "/to"
+      if (len == 3) {
+        command[3] = ' ';
+        command[4] = 0;
+        len = 4;
+      }
+      
+      const char* prefix = &command[4];
       
       // Use the same mechanism as "list" command to scan contacts
       autocomplete_visitor.reset(prefix);
@@ -289,13 +847,12 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
       
       if (autocomplete_visitor.match_count == 1) {
         // Single match - autocomplete it
-        snprintf(&command[3], sizeof(command) - 3, "%s", autocomplete_visitor.matching_names[0]);
-        len = 3 + strlen(autocomplete_visitor.matching_names[0]);
+        snprintf(&command[4], sizeof(command) - 4, "%s", autocomplete_visitor.matching_names[0]);
+        len = 4 + strlen(autocomplete_visitor.matching_names[0]);
         command[len] = 0;
         
-        // Redraw from beginning
-        Console.print("\r> ");
-        Console.print(command);
+        // Redraw from beginning with channel/recipient prefix
+        redrawPrompt();
       } else if (autocomplete_visitor.match_count > 1) {
         // Multiple matches - show them
         Console.println();
@@ -312,27 +869,48 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
         Console.print('\a');  // bell character (optional)
       }
     }
-    // Check if we're in a channel-related command: chsel, mute ch, unmute ch, del ch
-    else if ((len >= 6 && memcmp(command, "chsel ", 6) == 0) ||
-             (len >= 8 && memcmp(command, "mute ch ", 8) == 0) ||
-             (len >= 10 && memcmp(command, "unmute ch ", 10) == 0) ||
-             (len >= 7 && memcmp(command, "del ch ", 7) == 0)) {
+    // Case 5: Channel-related command completion: /chsel, /mute ch, /unmute ch, /del ch
+    else if ((len >= 6 && (memcmp(command, "/chsel", 6) == 0 && (len == 6 || command[6] == ' '))) ||
+             (len >= 8 && (memcmp(command, "/mute ch", 8) == 0 && (len == 8 || command[8] == ' '))) ||
+             (len >= 10 && (memcmp(command, "/unmute ch", 10) == 0 && (len == 10 || command[10] == ' '))) ||
+             (len >= 7 && (memcmp(command, "/del ch", 7) == 0 && (len == 7 || command[7] == ' ')))) {
       
       // Determine the prefix position
       const char* prefix = nullptr;
       int prefix_offset = 0;
-      if (memcmp(command, "chsel ", 6) == 0) {
-        prefix = &command[6];
-        prefix_offset = 6;
-      } else if (memcmp(command, "mute ch ", 8) == 0) {
-        prefix = &command[8];
-        prefix_offset = 8;
-      } else if (memcmp(command, "unmute ch ", 10) == 0) {
-        prefix = &command[10];
-        prefix_offset = 10;
-      } else if (memcmp(command, "del ch ", 7) == 0) {
+      if (len >= 6 && memcmp(command, "/chsel", 6) == 0) {
+        if (len == 6 || (len == 7 && command[6] == ' ')) {
+          // Just "/chsel" or "/chsel " - ensure space is there
+          command[6] = ' ';
+          command[7] = 0;
+          len = 7;
+        }
         prefix = &command[7];
         prefix_offset = 7;
+      } else if (len >= 8 && memcmp(command, "/mute ch", 8) == 0) {
+        if (len == 8 || (len == 9 && command[8] == ' ')) {
+          command[8] = ' ';
+          command[9] = 0;
+          len = 9;
+        }
+        prefix = &command[9];
+        prefix_offset = 9;
+      } else if (len >= 10 && memcmp(command, "/unmute ch", 10) == 0) {
+        if (len == 10 || (len == 11 && command[10] == ' ')) {
+          command[10] = ' ';
+          command[11] = 0;
+          len = 11;
+        }
+        prefix = &command[11];
+        prefix_offset = 11;
+      } else if (len >= 7 && memcmp(command, "/del ch", 7) == 0) {
+        if (len == 7 || (len == 8 && command[7] == ' ')) {
+          command[7] = ' ';
+          command[8] = 0;
+          len = 8;
+        }
+        prefix = &command[8];
+        prefix_offset = 8;
       }
       
       // Collect matching channels
@@ -360,9 +938,8 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
         len = prefix_offset + strlen(matching_channels[0]);
         command[len] = 0;
         
-        // Redraw from beginning
-        Console.print("\r> ");
-        Console.print(command);
+        // Redraw from beginning with channel/recipient prefix
+        redrawPrompt();
       } else if (match_count > 1) {
         // Multiple matches - show them
         Console.println();
@@ -613,6 +1190,155 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     }
   }
 
+  void loadChannelHistory() {
+    history_count = 0;
+    history_next_idx = 0;
+    
+    if (!_fs->exists("/channel_history")) {
+      return;
+    }
+    
+#if defined(NRF52_PLATFORM)
+    File file = _fs->open("/channel_history", FILE_O_READ);
+#elif defined(RP2040_PLATFORM)
+    File file = _fs->open("/channel_history", "r");
+#else
+    File file = _fs->open("/channel_history");
+#endif
+    
+    if (file) {
+      while (file.available() && history_count < MAX_CHANNEL_HISTORY) {
+        ChannelMessage& msg = history[history_count];
+        if (file.read((uint8_t*)&msg.timestamp, 4) == 4 &&
+            file.read((uint8_t*)msg.channel_name, 32) == 32 &&
+            file.read((uint8_t*)msg.sender_name, 32) == 32 &&
+            file.read((uint8_t*)msg.text, 128) == 128) {
+          history_count++;
+        } else {
+          break;
+        }
+      }
+      file.close();
+      history_next_idx = history_count % MAX_CHANNEL_HISTORY;
+    }
+  }
+
+  void saveChannelHistory() {
+#if defined(NRF52_PLATFORM)
+    _fs->remove("/channel_history");
+    File file = _fs->open("/channel_history", FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+    _fs->remove("/channel_history");
+    File file = _fs->open("/channel_history", "w");
+#else
+    _fs->remove("/channel_history");
+    File file = _fs->open("/channel_history", "w", true);
+#endif
+    
+    if (file) {
+      int count = (history_count < MAX_CHANNEL_HISTORY) ? history_count : MAX_CHANNEL_HISTORY;
+      for (int i = 0; i < count; i++) {
+        ChannelMessage& msg = history[i];
+        file.write((uint8_t*)&msg.timestamp, 4);
+        file.write((uint8_t*)msg.channel_name, 32);
+        file.write((uint8_t*)msg.sender_name, 32);
+        file.write((uint8_t*)msg.text, 128);
+      }
+      file.close();
+    }
+  }
+
+  void addChannelMessage(const char* channel_name, const char* sender_name, const char* text, uint32_t timestamp) {
+    ChannelMessage& msg = history[history_next_idx];
+    msg.timestamp = timestamp;
+    strncpy(msg.channel_name, channel_name, 31);
+    msg.channel_name[31] = 0;
+    strncpy(msg.sender_name, sender_name, 31);
+    msg.sender_name[31] = 0;
+    strncpy(msg.text, text, 127);
+    msg.text[127] = 0;
+    
+    history_next_idx = (history_next_idx + 1) % MAX_CHANNEL_HISTORY;
+    if (history_count < MAX_CHANNEL_HISTORY) {
+      history_count++;
+    }
+    
+    // Save to disk (we could optimize this to save only periodically)
+    saveChannelHistory();
+  }
+
+  // Direct message history methods
+  void loadDMHistory() {
+    dm_history_count = 0;
+    dm_history_next_idx = 0;
+    
+    if (!_fs->exists("/dm_history")) {
+      return;
+    }
+    
+#if defined(NRF52_PLATFORM)
+    File file = _fs->open("/dm_history", FILE_O_READ);
+#elif defined(RP2040_PLATFORM)
+    File file = _fs->open("/dm_history", "r");
+#else
+    File file = _fs->open("/dm_history");
+#endif
+    
+    if (file) {
+      while (file.available() && dm_history_count < MAX_DM_HISTORY) {
+        DirectMessage msg;
+        if (file.read((uint8_t*)&msg, sizeof(DirectMessage)) == sizeof(DirectMessage)) {
+          dm_history[dm_history_count++] = msg;
+        } else {
+          break;
+        }
+      }
+      file.close();
+      
+      dm_history_next_idx = dm_history_count % MAX_DM_HISTORY;
+    }
+  }
+
+  void saveDMHistory() {
+#if defined(NRF52_PLATFORM)
+    if (_fs->exists("/dm_history")) _fs->remove("/dm_history");
+    File file = _fs->open("/dm_history", FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+    if (_fs->exists("/dm_history")) _fs->remove("/dm_history");
+    File file = _fs->open("/dm_history", "w");
+#else
+    if (_fs->exists("/dm_history")) _fs->remove("/dm_history");
+    File file = _fs->open("/dm_history", "w", true);
+#endif
+
+    if (!file) {
+      return;
+    }
+    
+    int count = (dm_history_count < MAX_DM_HISTORY) ? dm_history_count : MAX_DM_HISTORY;
+    for (int i = 0; i < count; i++) {
+      file.write((uint8_t*)&dm_history[i], sizeof(DirectMessage));
+    }
+    file.close();
+  }
+
+  void addDMMessage(const char* contact_name, const char* text, uint32_t timestamp, bool outgoing) {
+    DirectMessage& msg = dm_history[dm_history_next_idx];
+    msg.timestamp = timestamp;
+    strncpy(msg.sender_name, contact_name, 31);
+    msg.sender_name[31] = 0;
+    strncpy(msg.text, text, 127);
+    msg.text[127] = 0;
+    msg.outgoing = outgoing;
+    
+    dm_history_next_idx = (dm_history_next_idx + 1) % MAX_DM_HISTORY;
+    if (dm_history_count < MAX_DM_HISTORY) {
+      dm_history_count++;
+    }
+    
+    saveDMHistory();
+  }
+
   void setClock(uint32_t timestamp) {
     uint32_t curr = getRTCClock()->getCurrentTime();
     if (timestamp > curr) {
@@ -661,7 +1387,7 @@ protected:
   void onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
     if (!_prefs.mute_adverts) {
       // TODO: if not in favs,  prompt to add as fav(?)
-      Console.print("\r\n");
+      clearPromptLine();
       Console.printf("ADVERT from -> %s", contact.name);
       Console.printf(" | type: %s", getTypeName(contact.type));
       Console.print(" | public key: "); mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE); Console.println();
@@ -672,15 +1398,16 @@ protected:
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
-    Console.print("\r\n");
-    Console.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t) contact.out_path_len);
+    clearPromptLine();
+    // Console.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t) contact.out_path_len);
+    // Path updates happen in background, no need to spam console
     redrawPrompt();
     saveContacts();
   }
 
   ContactInfo* processAck(const uint8_t *data) override {
     if (memcmp(data, &expected_ack_crc, 4) == 0) {     // got an ACK from recipient
-      Console.print("\r\n");
+      clearPromptLine();
       Console.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
       redrawPrompt();
       // NOTE: the same ACK can be received multiple times!
@@ -697,10 +1424,19 @@ protected:
     text_copy[sizeof(text_copy) - 1] = 0;
     removeDiacritics(text_copy);
     
-    Console.print("\r\n");  // carriage return + newline to separate from any input
-    Console.printf("(%s) MSG -> from %s | ", pkt->isRouteDirect() ? "DIRECT" : "FLOOD", from.name);
-    Console.printf(": %s\n", text_copy);
+    if (_prefs.bell_on_message) {
+      Console.print("\a");  // Bell - alert user of new message
+    }
+    
+    // Format: [DM][HH:MM][nickname] message
+    uint32_t ts = sender_timestamp ? sender_timestamp : getRTCClock()->getCurrentTime();
+    DateTime dt = getLocalTime(ts);
+    clearPromptLine();
+    Console.printf("[DM][%02d:%02d][%s] %s\n", dt.hour(), dt.minute(), from.name, text_copy);
     redrawPrompt();
+
+    // Store in DM history
+    addDMMessage(from.name, text, sender_timestamp, false);
 
     if (strcmp(text, "clock sync") == 0) {  // special text command
       setClock(sender_timestamp + 1);
@@ -729,19 +1465,34 @@ protected:
       return;  // Channel is muted, don't display
     }
     
+    // Extract sender name from message (format: "sender: message")
+    char sender_name[32] = "";
+    const char* colon = strchr(text, ':');
+    if (colon && (colon - text) < 32) {
+      int name_len = colon - text;
+      strncpy(sender_name, text, name_len);
+      sender_name[name_len] = 0;
+    }
+    
+    // Save to history (with original text, before diacritic removal)
+    addChannelMessage(channel_name, sender_name, text, timestamp);
+    
     // Create a mutable copy of the text to remove diacritics
     char text_copy[256];
     strncpy(text_copy, text, sizeof(text_copy) - 1);
     text_copy[sizeof(text_copy) - 1] = 0;
     removeDiacritics(text_copy);
     
-    Console.print("\r\n");  // carriage return + newline to separate from any input
-    
-    if (pkt->isRouteDirect()) {
-      Console.printf("[%s] DIRECT | %s\n", channel_name, text_copy);
-    } else {
-      Console.printf("[%s] FLOOD (hops %d) | %s\n", channel_name, pkt->path_len, text_copy);
+    if (_prefs.bell_on_message) {
+      Console.print("\a");  // Bell - alert user of new channel message
     }
+    
+    // Format: [CH][channel][HH:MM][nickname] message
+    uint32_t ts = timestamp ? timestamp : getRTCClock()->getCurrentTime();
+    DateTime dt = getLocalTime(ts);
+    clearPromptLine();
+    Console.printf("[CH][%s][%02d:%02d][%s] %s\n", 
+                   channel_name, dt.hour(), dt.minute(), sender_name, text_copy);
     redrawPrompt();
   }
 
@@ -762,7 +1513,9 @@ protected:
   }
 
   void onSendTimeout() override {
+    clearPromptLine();
     Console.println("   ERROR: timed out, no ACK.");
+    redrawPrompt();
   }
 
 public:
@@ -786,6 +1539,13 @@ public:
     _prefs.serial_enabled[1] = false;  // Serial1 disabled by default
     _prefs.serial_enabled[2] = false;  // Serial2 disabled by default
     
+    // Initialize WiFi settings
+    _prefs.wifi_ssid[0] = 0;      // empty SSID by default
+    _prefs.wifi_password[0] = 0;  // empty password
+    _prefs.wifi_enabled = false;  // WiFi disabled by default
+    _prefs.bell_on_message = false;  // bell disabled by default
+    _prefs.timezone_offset = 0;   // UTC by default
+    
     // Initialize channels array
     for (int i = 0; i < MAX_GROUP_CHANNELS - 1; i++) {
       _prefs.channels[i].active = false;
@@ -796,6 +1556,7 @@ public:
 
     command[0] = 0;
     curr_recipient = NULL;
+    last_dm_recipient = NULL;
   }
 
   float getFreqPref() const { return _prefs.freq; }
@@ -806,6 +1567,7 @@ public:
 
   void begin(FILESYSTEM& fs) {
     _fs = &fs;
+    prompt_shown = false;  // Initialize prompt flag
 
     BaseChatMesh::begin();
 
@@ -819,10 +1581,18 @@ public:
   #endif
     if (!store.load("_main", self_id, _prefs.node_name, sizeof(_prefs.node_name))) {  // legacy: node_name was from identity file
       // Need way to get some entropy to seed RNG
+      Console.flush();  // Clear any garbage data
+      delay(100);
+      while (Console.available()) Console.read();  // Flush input buffer
+      
       Console.println("Press ENTER to generate key:");
       char c = 0;
-      while (c != '\n') {   // wait for ENTER to be pressed
-        if (Console.available()) c = Console.read();
+      unsigned long start = millis();
+      while (c != '\n' && (millis() - start < 30000)) {   // wait for ENTER (30 sec timeout)
+        if (Console.available()) {
+          c = Console.read();
+        }
+        delay(10);  // Small delay to prevent busy-wait
       }
       ((StdRNG *)getRNG())->begin(millis());
 
@@ -848,6 +1618,8 @@ public:
     }
 
     loadContacts();
+    loadChannelHistory();  // Load channel message history
+    loadDMHistory();       // Load direct message history
     initChannels();  // Initialize all channels from prefs
     
     // Apply saved serial port configuration
@@ -857,6 +1629,76 @@ public:
       }
     }
   }
+  
+#if defined(ESP32)
+  void startWiFi() {
+    // Skip if WiFi not configured
+    if (!_prefs.wifi_enabled || _prefs.wifi_ssid[0] == 0) {
+      Console.println("WiFi not configured. Use 'wifi <ssid> <password>' to set up.");
+      return;
+    }
+    
+    Console.println();
+    Console.print("Connecting to WiFi: ");
+    Console.println(_prefs.wifi_ssid);
+    
+    // Suppress WiFi debug messages
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+    
+    // Connect as WiFi client
+    WiFi.mode(WIFI_STA);
+    
+    // Try 3 times with 8 second timeout each
+    bool connected = false;
+    for (int retry = 0; retry < 3 && !connected; retry++) {
+      if (retry > 0) {
+        Console.println();
+        Console.print("Retry ");
+        Console.print(retry);
+        Console.print("...");
+        delay(2000);  // 2 second pause between retries
+      }
+      
+      WiFi.begin(_prefs.wifi_ssid, _prefs.wifi_password);
+      
+      // Give WiFi a moment to initialize
+      delay(1000);
+      
+      // Wait for connection (max 8 seconds)
+      int attempts = 0;
+      while (WiFi.status() != WL_CONNECTED && attempts < 16) {  // 16 × 500ms = 8 seconds
+        delay(500);
+        Console.print(".");
+        attempts++;
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+      }
+    }
+    Console.println();
+    
+    if (connected) {
+      Console.print("WiFi connected! IP address: ");
+      Console.println(WiFi.localIP());
+      
+      // Start NTP sync (runs asynchronously in background)
+      Console.println("NTP time sync started");
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // GMT+0, no DST
+      
+      // Enable telnet server
+      Console.enableTelnet();
+      Console.print("Telnet server started on port ");
+      Console.println(TELNET_PORT);
+    } else {
+      Console.print("WiFi connection failed! Status: ");
+      Console.println(WiFi.status());
+      Console.println("   Reasons: Wrong password, out of range, or network issue");
+      Console.println("   Use 'wifi' to check settings or 'wifi disable' to turn off");
+      WiFi.mode(WIFI_OFF);
+    }
+  }
+#endif
 
   void checkPublicChannel() {
     if (active_channels[0] == NULL) {
@@ -907,7 +1749,11 @@ public:
     Console.println();
     Console.println("(enter 'help' for basic commands)");
     Console.println();
-    Console.print("\r> ");  // initial prompt
+  }
+  
+  void showPromptAfterInit() {
+    prompt_shown = true;
+    redrawPrompt();
   }
 
   void sendSelfAdvert(int delay_millis) {
@@ -939,7 +1785,14 @@ public:
           Console.println("   ERROR: unable to send.");
         } else {
           last_msg_sent = _ms->getMillis();
-          Console.printf("   (message sent - %s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
+          
+          // Display sent DM in same format
+          uint32_t ts = getRTCClock()->getCurrentTime();
+          DateTime dt = getLocalTime(ts);
+          Console.printf("[DM][%02d:%02d][%s] %s\n", dt.hour(), dt.minute(), curr_recipient->name, text);
+          
+          // Store sent message in DM history
+          addDMMessage(curr_recipient->name, text, ts, true);
         }
       } else {
         Console.println("   ERROR: no recipient selected (use 'to' cmd).");
@@ -968,7 +1821,12 @@ public:
       auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch->channel, temp, 5 + len);
       if (pkt) {
         sendFlood(pkt);
-        Console.printf("   Sent to [%s]\n", getChannelName(_prefs.selected_channel_idx));
+        
+        // Display sent channel message in same format
+        const char* channel_name = getChannelName(_prefs.selected_channel_idx);
+        DateTime dt = getLocalTime(timestamp);
+        Console.printf("[CH][%s][%02d:%02d][%s] %s\n", 
+                       channel_name, dt.hour(), dt.minute(), _prefs.node_name, &command[3]);
       } else {
         Console.println("   ERROR: unable to send");
       }
@@ -990,15 +1848,23 @@ public:
       scanRecentContacts(n, this);
     } else if (strcmp(command, "clock") == 0) {    // show current time
       uint32_t now = getRTCClock()->getCurrentTime();
-      DateTime dt = DateTime(now);
-      Console.printf(   "%02d:%02d - %d/%d/%d UTC\n", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+      DateTime dt_local = getLocalTime(now);
+      DateTime dt_utc = DateTime(now);
+      if (_prefs.timezone_offset == 0) {
+        Console.printf("   %02d:%02d - %d/%d/%d UTC\n", dt_utc.hour(), dt_utc.minute(), dt_utc.day(), dt_utc.month(), dt_utc.year());
+      } else {
+        Console.printf("   %02d:%02d - %d/%d/%d (UTC%+d)\n", dt_local.hour(), dt_local.minute(), dt_local.day(), dt_local.month(), dt_local.year(), _prefs.timezone_offset);
+        Console.printf("   %02d:%02d - %d/%d/%d UTC\n", dt_utc.hour(), dt_utc.minute(), dt_utc.day(), dt_utc.month(), dt_utc.year());
+      }
     } else if (memcmp(command, "time ", 5) == 0) {  // set time (to epoch seconds)
       uint32_t secs = _atoi(&command[5]);
       setClock(secs);
     } else if (memcmp(command, "to ", 3) == 0) {  // set current recipient
       curr_recipient = searchContactsByPrefix(&command[3]);
       if (curr_recipient) {
-        Console.printf("   Recipient %s now selected.\n", curr_recipient->name);
+        last_dm_recipient = curr_recipient;  // Remember for TAB rotation
+        // Console.printf("   Recipient %s now selected.\n", curr_recipient->name);
+        // Prompt will show TO:name automatically
       } else {
         Console.println("   Error: Name prefix not found.");
       }
@@ -1021,6 +1887,55 @@ public:
         resetPathTo(*curr_recipient);
         saveContacts();
         Console.println("   Done.");
+      }
+    } else if (memcmp(command, "history", 7) == 0) {
+      // Display message history
+      // Format: "history" shows all DMs, "history <name>" shows DMs or channel based on name lookup
+      const char* filter = (command[7] == ' ') ? &command[8] : NULL;
+      
+      // Try to find if filter is a channel name
+      int ch_idx = filter ? findChannelByName(filter) : -1;
+      
+      if (ch_idx >= 0) {
+        // It's a channel - show channel history
+        const char* channel_name = getChannelName(ch_idx);
+        Console.printf("Channel history for %s:\r\n", channel_name);
+        int count = (history_count < MAX_CHANNEL_HISTORY) ? history_count : MAX_CHANNEL_HISTORY;
+        int shown = 0;
+        for (int i = 0; i < count; i++) {
+          if (strcasecmp(history[i].channel_name, channel_name) == 0) {
+            DateTime dt = getLocalTime(history[i].timestamp);
+            Console.printf("  [%02d:%02d %d/%d] %s: %s\r\n",
+                          dt.hour(), dt.minute(), dt.day(), dt.month(),
+                          history[i].sender_name, history[i].text);
+            shown++;
+          }
+        }
+        if (shown == 0) {
+          Console.println("  (no messages)");
+        }
+      } else {
+        // Show DM history
+        if (filter) {
+          Console.printf("DM history with %s:\r\n", filter);
+        } else {
+          Console.println("DM history:");
+        }
+        int count = (dm_history_count < MAX_DM_HISTORY) ? dm_history_count : MAX_DM_HISTORY;
+        int shown = 0;
+        for (int i = 0; i < count; i++) {
+          if (!filter || strcmp(dm_history[i].sender_name, filter) == 0) {
+            DateTime dt = getLocalTime(dm_history[i].timestamp);
+            Console.printf("  [%02d:%02d %d/%d] %s %s: %s\r\n",
+                          dt.hour(), dt.minute(), dt.day(), dt.month(),
+                          dm_history[i].outgoing ? ">" : "<",
+                          dm_history[i].sender_name, dm_history[i].text);
+            shown++;
+          }
+        }
+        if (shown == 0) {
+          Console.println("  (no messages)");
+        }
       }
     } else if (memcmp(command, "card", 4) == 0) {
       Console.printf("Hello %s\n", _prefs.node_name);
@@ -1123,6 +2038,15 @@ public:
         _prefs.bw = atof(&config[3]);
         savePrefs();
         Console.println("  OK - reboot to apply");
+      } else if (memcmp(config, "tz ", 3) == 0) {
+        int tz = atoi(&config[3]);
+        if (tz >= -12 && tz <= 14) {
+          _prefs.timezone_offset = tz;
+          savePrefs();
+          Console.printf("  OK - timezone set to UTC%+d\n", tz);
+        } else {
+          Console.println("  ERROR: timezone must be between -12 and +14");
+        }
       } else {
         Console.printf("  ERROR: unknown config: %s\n", config);
       }
@@ -1157,6 +2081,11 @@ public:
         }
         if (show_all || strcmp(param, "af") == 0) {
           Console.print("  af:   "); Console.println(_prefs.airtime_factor, 2);
+        }
+        if (show_all || strcmp(param, "tz") == 0) {
+          Console.print("  tz:   UTC"); 
+          if (_prefs.timezone_offset >= 0) Console.print("+");
+          Console.println(_prefs.timezone_offset);
         }
         if (show_all || strcmp(param, "ch") == 0) {
           Console.println("  Channels:");
@@ -1224,8 +2153,12 @@ public:
           _prefs.mute_adverts = true;
           savePrefs();
           Console.println("   ADVERT messages muted");
+        } else if (strcmp(type, "bell") == 0) {
+          _prefs.bell_on_message = false;
+          savePrefs();
+          Console.println("   BELL notifications disabled");
         } else {
-          Console.println("   ERROR: unknown mute type (try: advert, or 'ch <name>')");
+          Console.println("   ERROR: unknown mute type (try: advert, bell, or 'ch <name>')");
         }
       }
     } else if (memcmp(command, "unmute", 6) == 0) {
@@ -1235,8 +2168,12 @@ public:
           _prefs.mute_adverts = false;
           savePrefs();
           Console.println("   ADVERT messages unmuted");
+        } else if (strcmp(type, "bell") == 0) {
+          _prefs.bell_on_message = true;
+          savePrefs();
+          Console.println("   BELL notifications enabled");
         } else {
-          Console.println("   ERROR: unknown unmute type (try: advert, or 'ch <name>')");
+          Console.println("   ERROR: unknown unmute type (try: advert, bell, or 'ch <name>')");
         }
       }
     } else if (memcmp(command, "reboot", 6) == 0) {
@@ -1284,44 +2221,127 @@ public:
       } else {
         Console.println("   Usage: serial list|enable <N>|disable <N>");
       }
-    } else if (memcmp(command, "help", 4) == 0) {
-      Console.println("Commands (page 1/2):");
-      Console.println("   set {name|lat|lon|freq|tx|sf|cr|bw|af} {value}");
-      Console.println("   set ch <name> <hex_key>  - add channel (32/64 hex chars)");
-      Console.println("   set ch #<name>           - add hashtag channel");
-      Console.println("   get [{name|lat|lon|freq|tx|sf|cr|bw|af|ch}]");
-      Console.println("   del ch <name>            - delete channel");
-      Console.println("   card                     - show your biz card");
-      Console.println("   import {biz card}        - import contact from biz card");
-      Console.println("   clock                    - show current time");
-      Console.println("   time <epoch-seconds>     - set current time");
-      Console.println("   list {n}                 - list recent contacts");
-      Console.print("-- Press SPACE for more, any other key to continue -- ");
-      
-      // Wait for user input
-      while (!Console.available()) {
-        delay(10);
+#if defined(ESP32)
+    } else if (memcmp(command, "wifi", 4) == 0) {
+      const char* subcmd = &command[5];
+      if (command[4] == 0) {
+        // Show WiFi status
+        Console.print("WiFi: ");
+        if (_prefs.wifi_enabled && _prefs.wifi_ssid[0] != 0) {
+          Console.println("ENABLED");
+          Console.print("   SSID: ");
+          Console.println(_prefs.wifi_ssid);
+          Console.print("   Status: ");
+          if (WiFi.status() == WL_CONNECTED) {
+            Console.print("Connected, IP: ");
+            Console.println(WiFi.localIP());
+            Console.print("   Telnet: ");
+            Console.print(Console.isTelnetEnabled() ? "listening" : "off");
+            if (Console.isTelnetConnected()) {
+              Console.print(" (client connected)");
+            }
+            Console.println();
+          } else {
+            Console.println("Not connected");
+          }
+        } else {
+          Console.println("Not configured");
+          Console.println("   Use: wifi <ssid> <password>");
+        }
+      } else if (memcmp(subcmd, "enable", 6) == 0) {
+        if (_prefs.wifi_ssid[0] == 0) {
+          Console.println("   ERROR: WiFi not configured. Use 'wifi <ssid> <password>' first.");
+        } else {
+          _prefs.wifi_enabled = true;
+          savePrefs();
+          Console.println("WiFi enabled. Rebooting to connect...");
+          delay(1000);
+          ESP.restart();
+        }
+      } else if (memcmp(subcmd, "disable", 7) == 0) {
+        _prefs.wifi_enabled = false;
+        savePrefs();
+        WiFi.mode(WIFI_OFF);
+        Console.disableTelnet();
+        Console.println("WiFi disabled");
+      } else {
+        // Parse SSID and password
+        const char* ssid_start = &command[5];
+        const char* space = strchr(ssid_start, ' ');
+        if (space) {
+          int ssid_len = space - ssid_start;
+          if (ssid_len > 0 && ssid_len < 64) {
+            memcpy(_prefs.wifi_ssid, ssid_start, ssid_len);
+            _prefs.wifi_ssid[ssid_len] = 0;
+            
+            const char* password_start = space + 1;
+            int password_len = strlen(password_start);
+            if (password_len < 64) {
+              strcpy(_prefs.wifi_password, password_start);
+              _prefs.wifi_enabled = true;
+              savePrefs();
+              
+              Console.print("WiFi configured: ");
+              Console.println(_prefs.wifi_ssid);
+              Console.println("Rebooting to connect...");
+              delay(1000);
+              ESP.restart();
+            } else {
+              Console.println("   ERROR: Password too long (max 63 chars)");
+            }
+          } else {
+            Console.println("   ERROR: SSID too long (max 63 chars)");
+          }
+        } else {
+          Console.println("   Usage: wifi <ssid> <password>");
+          Console.println("          wifi enable|disable");
+          Console.println("          wifi (show status)");
+        }
       }
-      char c = Console.read();
-      Console.println();
-      
-      if (c == ' ') {  // Show page 2
-        Console.println("Commands (page 2/2):");
-        Console.println("   to <recipient name>      - select recipient by name");
-        Console.println("   send <text>              - send to selected recipient");
-        Console.println("   chsel <name>             - select channel");
-        Console.println("   ch <text>                - send to selected channel");
-        Console.println("   mute|unmute ch <name>    - mute/unmute channel");
-        Console.println("   mute|unmute [advert]     - mute/unmute adverts");
-        Console.println("   serial list              - list serial ports");
-        Console.println("   serial enable|disable <N> - enable/disable serial port");
-        Console.println("   advert                   - send advert");
-        Console.println("   reset path               - reset route path");
-        Console.println("   reboot                   - reboot device");
-        Console.println();
-        Console.println("Keyboard shortcuts:");
-        Console.println("   TAB - autocomplete contact or channel names");
-        Console.println("   ESC - clear current input line");
+#endif
+    } else if (memcmp(command, "help", 4) == 0) {
+      Console.println("Commands:");
+      bool stopped = false;
+      for (int i = 0; i < COMMANDS_COUNT && !stopped; i++) {
+        Console.print("   /");
+        Console.print(COMMANDS[i].name);
+        if (COMMANDS[i].args[0] != 0) {
+          Console.print(" ");
+          Console.print(COMMANDS[i].args);
+        }
+        // Pad to align descriptions
+        int len = strlen(COMMANDS[i].name) + strlen(COMMANDS[i].args) + 1;
+        for (int j = len; j < 30; j++) Console.print(" ");
+        Console.print("- ");
+        Console.println(COMMANDS[i].description);
+        
+        // Pagination: every 10 commands, wait for key (space continues, other stops)
+        if ((i + 1) % 10 == 0 && i < COMMANDS_COUNT - 1) {
+          Console.print("--- SPACE to continue, any other key to stop ---");
+          Console.flush();
+          
+          // Wait for a printable character (skip telnet control sequences)
+          char c = 0;
+          while (c < 32 || c >= 127) {  // Skip non-printable characters
+            while (!Console.available()) {
+              delay(10);
+            }
+            c = Console.read();
+          }
+          
+          Console.println("\r                                                 \r");  // clear the prompt line
+          if (c != ' ') {
+            stopped = true;
+          }
+        }
+      }
+      if (!stopped) {
+        Console.println("Tips:");
+        Console.println("   - Type text without '/' to send to CH: or TO:");
+        Console.println("   - TAB on empty prompt to switch channels or return to CH:");
+        Console.println("   - TAB after '/' to autocomplete commands");
+        Console.println("   - TAB to autocomplete @mentions and contact names");
+        Console.println("   - ESC to clear current input");
       }
     } else {
       Console.print("   ERROR: unknown command: "); Console.println(command);
@@ -1331,32 +2351,62 @@ public:
   void loop() {
     BaseChatMesh::loop();
 
+#if defined(ESP32)
+    // Handle telnet connections
+    Console.handleTelnet();
+    
+    // Show prompt for new telnet connection
+    if (Console.checkAndClearNewTelnetConnection()) {
+      redrawPrompt();
+    }
+#endif
+
     int len = strlen(command);
     while (Console.available() && len < sizeof(command)-1) {
       char c = Console.read();
       if (c == '\r' || c == '\n') {
         if (len > 0) {  // have command to process
           command[len] = 0;  // null terminate
-          Console.println();  // echo newline
-          handleCommand(command);
-          Console.print("\r> ");  // prompt for next command
-          command[0] = 0;  // reset
+          
+          // If command doesn't start with /, it's plain text - clear prompt instead of keeping it
+          if (command[0] != '/') {
+            clearPromptLine();  // Clear prompt for messages
+            char temp[256];
+            // If TO: is set, send as DM. Otherwise send to channel.
+            if (curr_recipient) {
+              snprintf(temp, sizeof(temp), "send %s", command);
+            } else {
+              snprintf(temp, sizeof(temp), "ch %s", command);
+            }
+            handleCommand(temp);
+          } else {
+            // For commands, keep them visible
+            Console.println();
+            // Strip the / prefix and handle as command
+            handleCommand(&command[1]);
+          }
+          
+          command[0] = 0;  // reset command buffer before redrawing prompt
           len = 0;
+          redrawPrompt();  // prompt for next command with channel/recipient prefix
         }
       } else if (c == '\t' || c == 9) {  // Tab key for autocomplete
         command[len] = 0;  // ensure null termination
         handleTabCompletion(len);
       } else if (c == 27) {  // Escape key - clear current command
-        // Clear the current line by overwriting with spaces
+        // Clear the current line including prompt and command
+        char prefix[128];
+        getPromptPrefix(prefix, sizeof(prefix));
+        int total_len = strlen(prefix) + 2 + len;  // +2 for "> "
         Console.print('\r');
-        for (int i = 0; i < len + 2; i++) {  // +2 for "> "
+        for (int i = 0; i < total_len; i++) {
           Console.print(' ');
         }
         // Reset command buffer
         command[0] = 0;
         len = 0;
-        // Show fresh prompt
-        Console.print("\r> ");
+        // Show fresh prompt with channel/recipient prefix
+        redrawPrompt();
       } else if (c == 8 || c == 127) {  // backspace or delete
         if (len > 0) {
           len--;
@@ -1388,8 +2438,24 @@ void halt() {
 void setup() {
   // Initialize USB Serial (always enabled)
   Serial.begin(SERIAL_BAUD);
-  // Note: Serial1 and Serial2 will be initialized when enabled via 'serial enable' command
+  
+#if defined(ESP32)
+  // ESP32 USB CDC needs more time to initialize
+  delay(2000);  // Increase delay for better reliability
+  // Clear bootloader garbage
+  Serial.flush();
+  while (Serial.available()) Serial.read();
+  
+  // Test output to verify Serial is working
+  Serial.println();
+  Serial.println("=== MeshCore Terminal Starting ===");
+  Serial.print("SERIAL_BAUD = ");
+  Serial.println(SERIAL_BAUD);
+#else
   delay(100);  // Give serial time to initialize
+#endif
+  
+  // Note: Serial1 and Serial2 will be initialized when enabled via 'serial enable' command
 
   board.begin();
 
@@ -1416,6 +2482,15 @@ void setup() {
   radio_set_tx_power(the_mesh.getTxPowerPref());
 
   the_mesh.showWelcome();
+
+#if defined(ESP32)
+  // Start WiFi after welcome message to ensure Serial is working
+  the_mesh.startWiFi();
+  
+  // Show prompt after WiFi is done
+  Console.println();
+  the_mesh.showPromptAfterInit();
+#endif
 
   // send out initial Advertisement to the mesh
   the_mesh.sendSelfAdvert(1200);
